@@ -1,0 +1,382 @@
+// metrics.grav — what the queue dashboard knows, and where it keeps it: the
+// recent jobs, jobs per minute, each job class's counts and run times, the
+// workers, and the queues seen. Workers usually run in other processes than
+// the web app showing the dashboard, so the store can be Redis (they all write
+// to it, the dashboard reads it); MemoryDashboardStore is for one process.
+import "std"
+import "grav-redis"
+use redis.*
+
+namespace apogee {
+
+    // One job as the dashboard saw it.
+    class JobRecord {
+        public id: string
+        public job: string = ""
+        public connection: string = ""
+        public queue: string = ""
+        // "queued", "processing", "processed", "released", "failed"
+        public status: string = "queued"
+        public attempts: int = 0
+        // Unix milliseconds (0: not yet).
+        public queuedAt: long = 0
+        public startedAt: long = 0
+        public finishedAt: long = 0
+        public ms: long = 0
+        public error: string = ""
+        constructor(id: string) { self.id = id; }
+
+        fn toJson() -> JsonValue {
+            let o = Json.object();
+            o.set("id", self.id);
+            o.set("job", self.job);
+            o.set("connection", self.connection);
+            o.set("queue", self.queue);
+            o.set("status", self.status);
+            o.set("attempts", self.attempts as long);
+            o.set("queuedAt", self.queuedAt);
+            o.set("startedAt", self.startedAt);
+            o.set("finishedAt", self.finishedAt);
+            o.set("ms", self.ms);
+            o.set("error", self.error);
+            return o;
+        }
+        static fn fromJson(j: JsonValue) -> JobRecord {
+            let r = new JobRecord(j.getString("id", ""));
+            r.job = j.getString("job", "");
+            r.connection = j.getString("connection", "");
+            r.queue = j.getString("queue", "");
+            r.status = j.getString("status", "queued");
+            r.attempts = j.getInt("attempts", 0);
+            r.queuedAt = j.getLong("queuedAt", 0);
+            r.startedAt = j.getLong("startedAt", 0);
+            r.finishedAt = j.getLong("finishedAt", 0);
+            r.ms = j.getLong("ms", 0);
+            r.error = j.getString("error", "");
+            return r;
+        }
+    }
+
+    // Jobs finished in one minute.
+    class MinuteStat {
+        public minute: long      // unix seconds / 60
+        public processed: long = 0
+        public failed: long = 0
+        constructor(minute: long) { self.minute = minute; }
+    }
+
+    // A job class's totals.
+    class JobMetric {
+        public job: string
+        public processed: long = 0
+        public failed: long = 0
+        public totalMs: long = 0
+        public maxMs: long = 0
+        constructor(job: string) { self.job = job; }
+        fn averageMs() -> long { return self.processed == 0 ? 0 : self.totalMs / self.processed; }
+    }
+
+    class WorkerInfo {
+        public name: string
+        public connection: string = ""
+        public queues: string = ""
+        public startedAt: long = 0      // unix ms
+        public stoppedAt: long = 0      // 0: running
+        constructor(name: string) { self.name = name; }
+        fn running() -> bool { return self.stoppedAt == 0; }
+    }
+
+    interface DashboardStore {
+        // Adds or replaces a job record (by id); the store keeps the newest `keep`.
+        fn saveJob(r: JobRecord)
+        fn job(id: string) -> JobRecord
+        // Newest first.
+        fn recentJobs(limit: int) -> Array<JobRecord>
+        fn countMinute(minute: long, processed: long, failed: long)
+        // From `sinceMinute` on, oldest first, with empty minutes filled in.
+        fn minutes(sinceMinute: long, untilMinute: long) -> Array<MinuteStat>
+        fn countJob(job: string, ms: long, failed: bool)
+        fn jobMetrics() -> Array<JobMetric>
+        fn workerStarted(w: WorkerInfo)
+        fn workerStopped(name: string, at: long)
+        fn workers() -> Array<WorkerInfo>
+        // A queue ("connection|queue") jobs were seen on.
+        fn noteQueue(connection: string, queue: string)
+        fn queues() -> Array<string>
+        // Forgets everything.
+        fn clear()
+    }
+
+    // In this process's memory. Thread-safe.
+    class MemoryDashboardStore implements DashboardStore {
+        public keep: int
+        private jobs: HashMap<string, JobRecord>
+        private order: Deque<string>
+        private perMinute: HashMap<long, MinuteStat>
+        private perJob: HashMap<string, JobMetric>
+        private workerMap: HashMap<string, WorkerInfo>
+        private seen: HashSet<string>
+        private lock: Mutex
+        constructor(keep: int = 1000) {
+            self.keep = keep;
+            self.jobs = new HashMap<string, JobRecord>();
+            self.order = new Deque<string>();
+            self.perMinute = new HashMap<long, MinuteStat>();
+            self.perJob = new HashMap<string, JobMetric>();
+            self.workerMap = new HashMap<string, WorkerInfo>();
+            self.seen = new HashSet<string>();
+            self.lock = new Mutex();
+        }
+        fn saveJob(r: JobRecord) {
+            self.lock.lock();
+            if (!self.jobs.containsKey(r.id)) {
+                self.order.pushFront(r.id);
+                while (self.order.size() > self.keep) { self.jobs.remove(self.order.popBack()); }
+            }
+            self.jobs.put(r.id, r);
+            self.lock.unlock();
+        }
+        fn job(id: string) -> JobRecord {
+            self.lock.lock();
+            let r = self.jobs.getOr(id, null);
+            self.lock.unlock();
+            return r;
+        }
+        fn recentJobs(limit: int) -> Array<JobRecord> {
+            let out = new Array<JobRecord>();
+            self.lock.lock();
+            for (id in self.order) {
+                if (out.size() >= limit) { break; }
+                let r = self.jobs.getOr(id, null);
+                if (r != null) { out.push(r); }
+            }
+            self.lock.unlock();
+            return out;
+        }
+        fn countMinute(minute: long, processed: long, failed: long) {
+            self.lock.lock();
+            let m = self.perMinute.getOr(minute, null);
+            if (m == null) { m = new MinuteStat(minute); self.perMinute.put(minute, m); }
+            m.processed += processed;
+            m.failed += failed;
+            // (two days of minutes at most)
+            if (self.perMinute.size() > 2880) {
+                for (k in self.perMinute.keys()) { if (k < minute - 2880) { self.perMinute.remove(k); } }
+            }
+            self.lock.unlock();
+        }
+        fn minutes(sinceMinute: long, untilMinute: long) -> Array<MinuteStat> {
+            let out = new Array<MinuteStat>();
+            self.lock.lock();
+            let m = sinceMinute;
+            while (m <= untilMinute) {
+                let s = self.perMinute.getOr(m, null);
+                let copy = new MinuteStat(m);
+                if (s != null) { copy.processed = s.processed; copy.failed = s.failed; }
+                out.push(copy);
+                m += 1;
+            }
+            self.lock.unlock();
+            return out;
+        }
+        fn countJob(job: string, ms: long, failed: bool) {
+            self.lock.lock();
+            let j = self.perJob.getOr(job, null);
+            if (j == null) { j = new JobMetric(job); self.perJob.put(job, j); }
+            if (failed) { j.failed += 1; }
+            else {
+                j.processed += 1;
+                j.totalMs += ms;
+                if (ms > j.maxMs) { j.maxMs = ms; }
+            }
+            self.lock.unlock();
+        }
+        fn jobMetrics() -> Array<JobMetric> {
+            self.lock.lock();
+            let out = self.perJob.values();
+            self.lock.unlock();
+            out.sortBy(fn(a: JobMetric, b: JobMetric) => Str.compare(a.job, b.job));
+            return out;
+        }
+        fn workerStarted(w: WorkerInfo) { self.lock.lock(); self.workerMap.put(w.name, w); self.lock.unlock(); }
+        fn workerStopped(name: string, at: long) {
+            self.lock.lock();
+            let w = self.workerMap.getOr(name, null);
+            if (w != null) { w.stoppedAt = at; }
+            self.lock.unlock();
+        }
+        fn workers() -> Array<WorkerInfo> {
+            self.lock.lock();
+            let out = self.workerMap.values();
+            self.lock.unlock();
+            out.sortBy(fn(a: WorkerInfo, b: WorkerInfo) => Str.compare(a.name, b.name));
+            return out;
+        }
+        fn noteQueue(connection: string, queue: string) { self.lock.lock(); self.seen.add(connection + "|" + queue); self.lock.unlock(); }
+        fn queues() -> Array<string> {
+            self.lock.lock();
+            let out = self.seen.toArray();
+            self.lock.unlock();
+            out.sortBy(fn(a, b) => Str.compare(a, b));
+            return out;
+        }
+        fn clear() {
+            self.lock.lock();
+            self.jobs.clear(); self.order.clear(); self.perMinute.clear(); self.perJob.clear(); self.workerMap.clear(); self.seen.clear();
+            self.lock.unlock();
+        }
+    }
+
+    // In Redis, shared by every process (workers write, the dashboard reads).
+    // Keys start with `prefix`; per-minute counts expire after two days.
+    class RedisDashboardStore implements DashboardStore {
+        public keep: int
+        public prefix: string
+        private redis: RedisConnection
+        private lock: Mutex
+        constructor(redis: RedisConnection, prefix: string = "queue-dashboard:", keep: int = 1000) {
+            self.redis = redis;
+            self.prefix = prefix;
+            self.keep = keep;
+            self.lock = new Mutex();
+        }
+        private fn k(name: string) -> string { return self.prefix + name; }
+        fn saveJob(r: JobRecord) {
+            self.lock.lock();
+            let isNew = self.redis.hSet(self.k("jobs"), r.id, r.toJson().toJson()) == 1;
+            if (isNew) {
+                self.redis.lPush(self.k("recent"), r.id);
+                let dropped = self.redis.lRange(self.k("recent"), self.keep as long, -1);
+                if (dropped.size() > 0) {
+                    self.redis.lTrim(self.k("recent"), 0, (self.keep - 1) as long);
+                    self.redis.hDel(self.k("jobs"), dropped);
+                }
+            }
+            self.lock.unlock();
+        }
+        fn job(id: string) -> JobRecord {
+            self.lock.lock();
+            let text = self.redis.hGet(self.k("jobs"), id);
+            self.lock.unlock();
+            return text == null ? null : JobRecord.fromJson(Json.parse(text));
+        }
+        fn recentJobs(limit: int) -> Array<JobRecord> {
+            let out = new Array<JobRecord>();
+            self.lock.lock();
+            let ids = self.redis.lRange(self.k("recent"), 0, (limit - 1) as long);
+            let all = self.redis.hGetAll(self.k("jobs"));
+            self.lock.unlock();
+            for (id in ids) {
+                if (all.containsKey(id)) { out.push(JobRecord.fromJson(Json.parse(all.get(id)))); }
+            }
+            return out;
+        }
+        fn countMinute(minute: long, processed: long, failed: long) {
+            let key = self.k("minute:" + str(minute));
+            self.lock.lock();
+            if (processed != 0) { self.redis.hIncrBy(key, "processed", processed); }
+            if (failed != 0) { self.redis.hIncrBy(key, "failed", failed); }
+            self.redis.expire(key, 172800);
+            self.lock.unlock();
+        }
+        fn minutes(sinceMinute: long, untilMinute: long) -> Array<MinuteStat> {
+            let out = new Array<MinuteStat>();
+            self.lock.lock();
+            let m = sinceMinute;
+            while (m <= untilMinute) {
+                let h = self.redis.hGetAll(self.k("minute:" + str(m)));
+                let s = new MinuteStat(m);
+                s.processed = Integer.parseOr(h.getOr("processed", "0"), 0);
+                s.failed = Integer.parseOr(h.getOr("failed", "0"), 0);
+                out.push(s);
+                m += 1;
+            }
+            self.lock.unlock();
+            return out;
+        }
+        fn countJob(job: string, ms: long, failed: bool) {
+            let key = self.k("job:" + job);
+            self.lock.lock();
+            self.redis.sAdd(self.k("job-classes"), job);
+            if (failed) { self.redis.hIncrBy(key, "failed", 1); }
+            else {
+                self.redis.hIncrBy(key, "processed", 1);
+                self.redis.hIncrBy(key, "totalMs", ms);
+                let max = Integer.parseOr(self.redis.hGet(key, "maxMs") ?? "0", 0);
+                if (ms > max) { self.redis.hSet(key, "maxMs", ms); }
+            }
+            self.lock.unlock();
+        }
+        fn jobMetrics() -> Array<JobMetric> {
+            let out = new Array<JobMetric>();
+            self.lock.lock();
+            for (job in self.redis.sMembers(self.k("job-classes"))) {
+                let h = self.redis.hGetAll(self.k("job:" + job));
+                let m = new JobMetric(job);
+                m.processed = Integer.parseOr(h.getOr("processed", "0"), 0);
+                m.failed = Integer.parseOr(h.getOr("failed", "0"), 0);
+                m.totalMs = Integer.parseOr(h.getOr("totalMs", "0"), 0);
+                m.maxMs = Integer.parseOr(h.getOr("maxMs", "0"), 0);
+                out.push(m);
+            }
+            self.lock.unlock();
+            out.sortBy(fn(a: JobMetric, b: JobMetric) => Str.compare(a.job, b.job));
+            return out;
+        }
+        fn workerStarted(w: WorkerInfo) {
+            let o = Json.object();
+            o.set("connection", w.connection);
+            o.set("queues", w.queues);
+            o.set("startedAt", w.startedAt);
+            o.set("stoppedAt", 0 as long);
+            self.lock.lock();
+            self.redis.hSet(self.k("workers"), w.name, o.toJson());
+            self.lock.unlock();
+        }
+        fn workerStopped(name: string, at: long) {
+            self.lock.lock();
+            let text = self.redis.hGet(self.k("workers"), name);
+            if (text != null) {
+                let o = Json.parse(text);
+                o.set("stoppedAt", at);
+                self.redis.hSet(self.k("workers"), name, o.toJson());
+            }
+            self.lock.unlock();
+        }
+        fn workers() -> Array<WorkerInfo> {
+            self.lock.lock();
+            let all = self.redis.hGetAll(self.k("workers"));
+            self.lock.unlock();
+            let out = new Array<WorkerInfo>();
+            for ((name, text) in all) {
+                let o = Json.parse(text);
+                let w = new WorkerInfo(name);
+                w.connection = o.getString("connection", "");
+                w.queues = o.getString("queues", "");
+                w.startedAt = o.getLong("startedAt", 0);
+                w.stoppedAt = o.getLong("stoppedAt", 0);
+                out.push(w);
+            }
+            out.sortBy(fn(a: WorkerInfo, b: WorkerInfo) => Str.compare(a.name, b.name));
+            return out;
+        }
+        fn noteQueue(connection: string, queue: string) {
+            self.lock.lock();
+            self.redis.sAdd(self.k("queues"), connection + "|" + queue);
+            self.lock.unlock();
+        }
+        fn queues() -> Array<string> {
+            self.lock.lock();
+            let out = self.redis.sMembers(self.k("queues"));
+            self.lock.unlock();
+            out.sortBy(fn(a, b) => Str.compare(a, b));
+            return out;
+        }
+        fn clear() {
+            self.lock.lock();
+            let ks = self.redis.keys(self.prefix + "*");
+            if (ks.size() > 0) { self.redis.del(ks); }
+            self.lock.unlock();
+        }
+    }
+}
