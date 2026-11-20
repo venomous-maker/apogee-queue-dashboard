@@ -1,0 +1,150 @@
+// page.grav — the dashboard's page: one HTML file with its CSS and script,
+// no build step and nothing fetched from elsewhere. It asks the JSON API every
+// few seconds.
+import "std"
+
+namespace apogee {
+
+    class DashboardPage {
+        // The page, its API under `base`.
+        static fn html(base: string) -> string { return Str.replace(DashboardPage.template(), "__BASE__", base); }
+
+        private static fn template() -> string {
+            return r"""<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Queue dashboard</title>
+<style>
+:root { --bg: #f6f7f9; --panel: #fff; --text: #1d2330; --muted: #6b7385; --line: #e3e6ec;
+        --accent: #3a63d8; --ok: #1e8e4a; --warn: #b7791f; --bad: #c53030; --bar: #3a63d8; --barbad: #e05252; }
+@media (prefers-color-scheme: dark) {
+  :root { --bg: #11141a; --panel: #1a1f28; --text: #e6e9ef; --muted: #8e97a8; --line: #2a313d;
+          --accent: #7c9cf5; --ok: #48bb78; --warn: #ecc94b; --bad: #fc8181; --bar: #7c9cf5; --barbad: #fc8181; }
+}
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--bg); color: var(--text); font: 14px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif; }
+header { display: flex; align-items: center; gap: 12px; padding: 18px 24px; border-bottom: 1px solid var(--line); background: var(--panel); }
+header h1 { font-size: 18px; margin: 0; font-weight: 600; }
+.pill { padding: 2px 10px; border-radius: 999px; font-size: 12px; font-weight: 600; }
+.pill.running { background: color-mix(in srgb, var(--ok) 18%, transparent); color: var(--ok); }
+.pill.inactive { background: color-mix(in srgb, var(--warn) 18%, transparent); color: var(--warn); }
+.updated { margin-left: auto; color: var(--muted); font-size: 12px; }
+main { padding: 20px 24px; max-width: 1200px; margin: 0 auto; display: grid; gap: 20px; }
+.cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); gap: 14px; }
+.card, section { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; }
+.card { padding: 14px 16px; }
+.card .label { color: var(--muted); font-size: 12px; text-transform: uppercase; letter-spacing: .04em; }
+.card .value { font-size: 26px; font-weight: 600; margin-top: 4px; font-variant-numeric: tabular-nums; }
+.card .value.bad { color: var(--bad); }
+section h2 { font-size: 14px; margin: 0; padding: 12px 16px; border-bottom: 1px solid var(--line); display: flex; align-items: center; gap: 8px; }
+section h2 .right { margin-left: auto; }
+.chart { padding: 12px 16px; }
+.chart svg { width: 100%; height: 120px; display: block; }
+table { width: 100%; border-collapse: collapse; }
+th, td { text-align: left; padding: 8px 16px; border-bottom: 1px solid var(--line); vertical-align: top; }
+th { color: var(--muted); font-weight: 500; font-size: 12px; }
+td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
+tr:last-child td { border-bottom: none; }
+.empty { padding: 16px; color: var(--muted); }
+.status { font-weight: 600; font-size: 12px; }
+.status.processed { color: var(--ok); } .status.failed { color: var(--bad); }
+.status.processing, .status.released { color: var(--warn); } .status.queued { color: var(--muted); }
+.err { color: var(--bad); font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; white-space: pre-wrap; max-height: 4.5em; overflow: hidden; }
+button { font: inherit; font-size: 12px; padding: 4px 10px; border-radius: 6px; border: 1px solid var(--line); background: var(--panel); color: var(--text); cursor: pointer; }
+button:hover { border-color: var(--accent); color: var(--accent); }
+button.danger:hover { border-color: var(--bad); color: var(--bad); }
+.tabs button.on { border-color: var(--accent); color: var(--accent); }
+.scroll { overflow-x: auto; }
+</style>
+</head>
+<body>
+<header>
+  <h1>Queue dashboard</h1>
+  <span id="status" class="pill inactive">…</span>
+  <span class="updated" id="updated"></span>
+</header>
+<main>
+  <div class="cards">
+    <div class="card"><div class="label">Jobs per minute</div><div class="value" id="jpm">–</div></div>
+    <div class="card"><div class="label">Processed, last hour</div><div class="value" id="hour">–</div></div>
+    <div class="card"><div class="label">Failed, last hour</div><div class="value" id="failedHour">–</div></div>
+    <div class="card"><div class="label">Failed jobs kept</div><div class="value" id="failedTotal">–</div></div>
+    <div class="card"><div class="label">Workers running</div><div class="value" id="workersRunning">–</div></div>
+  </div>
+  <section><h2>Throughput, last hour</h2><div class="chart"><svg id="chart" viewBox="0 0 600 120" preserveAspectRatio="none" role="img" aria-label="Jobs per minute"></svg></div></section>
+  <section><h2>Queues</h2><div class="scroll"><table id="queues"></table></div></section>
+  <section><h2>Recent jobs <span class="right tabs" id="tabs"></span></h2><div class="scroll"><table id="recent"></table></div></section>
+  <section><h2>Failed jobs <span class="right"><button id="retryAll">Retry all</button></span></h2><div class="scroll"><table id="failed"></table></div></section>
+  <section><h2>Jobs by class</h2><div class="scroll"><table id="metrics"></table></div></section>
+  <section><h2>Workers</h2><div class="scroll"><table id="workers"></table></div></section>
+</main>
+<script>
+const base = "__BASE__";
+let filter = "";
+const $ = (id) => document.getElementById(id);
+const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+const ago = (ms) => { if (!ms) return "–"; const s = Math.max(0, Math.round((Date.now() - ms) / 1000));
+  return s < 60 ? s + "s ago" : s < 3600 ? Math.round(s / 60) + "m ago" : s < 86400 ? Math.round(s / 3600) + "h ago" : Math.round(s / 86400) + "d ago"; };
+const get = (path) => fetch(base + path, { headers: { Accept: "application/json" } }).then((r) => r.json());
+const send = (method, path) => fetch(base + path, { method, headers: { Accept: "application/json", "X-Requested-With": "XMLHttpRequest" } }).then(refresh);
+function table(el, head, rows, empty) {
+  if (!rows.length) { el.innerHTML = `<tr><td class="empty">${empty}</td></tr>`; return; }
+  el.innerHTML = "<tr>" + head.map((h) => `<th class="${h[1] || ""}">${h[0]}</th>`).join("") + "</tr>" + rows.join("");
+}
+function chart(points) {
+  const max = Math.max(1, ...points.map((p) => p.processed + p.failed));
+  const w = 600 / points.length;
+  $("chart").innerHTML = points.map((p, i) => {
+    const h1 = (p.processed / max) * 110, h2 = (p.failed / max) * 110;
+    return `<rect x="${i * w + 1}" y="${118 - h1 - h2}" width="${w - 2}" height="${h1}" fill="var(--bar)" rx="1"><title>${p.processed} processed</title></rect>` +
+           `<rect x="${i * w + 1}" y="${118 - h2}" width="${w - 2}" height="${h2}" fill="var(--barbad)" rx="1"><title>${p.failed} failed</title></rect>`;
+  }).join("");
+}
+function tabs() {
+  $("tabs").innerHTML = ["", "processing", "processed", "failed"].map((s) =>
+    `<button class="${s === filter ? "on" : ""}" data-s="${s}">${s || "all"}</button>`).join(" ");
+  $("tabs").querySelectorAll("button").forEach((b) => b.onclick = () => { filter = b.dataset.s; tabs(); refresh(); });
+}
+async function refresh() {
+  try {
+    const [stats, points, recent, failed, metrics] = await Promise.all([
+      get("/api/stats"), get("/api/throughput"), get("/api/jobs/recent?limit=25&status=" + filter), get("/api/jobs/failed"), get("/api/metrics/jobs")]);
+    $("status").textContent = stats.status; $("status").className = "pill " + stats.status;
+    $("jpm").textContent = stats.jobsPerMinute; $("hour").textContent = stats.processedLastHour;
+    $("failedHour").textContent = stats.failedLastHour; $("failedHour").className = "value" + (stats.failedLastHour ? " bad" : "");
+    $("failedTotal").textContent = stats.failedTotal;
+    $("workersRunning").textContent = stats.workers.filter((w) => w.running).length;
+    chart(points);
+    table($("queues"), [["Connection"], ["Queue"], ["Waiting", "num"], ["Delayed", "num"], ["Reserved", "num"]],
+      stats.queues.map((q) => `<tr><td>${esc(q.connection)}</td><td>${esc(q.queue)}</td><td class="num">${q.waiting ?? "–"}</td><td class="num">${q.delayed ?? "–"}</td><td class="num">${q.reserved ?? "–"}</td></tr>`),
+      "No queues seen yet.");
+    table($("recent"), [["Job"], ["Queue"], ["Status"], ["Attempts", "num"], ["Runtime", "num"], ["When"]],
+      recent.map((j) => `<tr><td>${esc(j.job)}<div class="err">${esc(j.error)}</div></td><td>${esc(j.queue)}</td><td><span class="status ${esc(j.status)}">${esc(j.status)}</span></td>` +
+        `<td class="num">${j.attempts}</td><td class="num">${j.ms ? j.ms + " ms" : "–"}</td><td>${ago(j.finishedAt || j.startedAt || j.queuedAt)}</td></tr>`),
+      "No jobs yet.");
+    table($("failed"), [["Job"], ["Queue"], ["Failed"], ["Exception"], [""]],
+      failed.map((f) => `<tr><td>${esc(f.job)}</td><td>${esc(f.queue)}</td><td>${ago(f.failedAt)}</td><td><div class="err">${esc(f.exception)}</div></td>` +
+        `<td><button data-retry="${esc(f.id)}">Retry</button> <button class="danger" data-forget="${esc(f.id)}">Forget</button></td></tr>`),
+      "No failed jobs.");
+    document.querySelectorAll("[data-retry]").forEach((b) => b.onclick = () => send("POST", "/api/jobs/failed/" + encodeURIComponent(b.dataset.retry) + "/retry"));
+    document.querySelectorAll("[data-forget]").forEach((b) => b.onclick = () => send("DELETE", "/api/jobs/failed/" + encodeURIComponent(b.dataset.forget)));
+    table($("metrics"), [["Job"], ["Processed", "num"], ["Failed", "num"], ["Average", "num"], ["Slowest", "num"]],
+      metrics.map((m) => `<tr><td>${esc(m.job)}</td><td class="num">${m.processed}</td><td class="num">${m.failed}</td><td class="num">${m.averageMs} ms</td><td class="num">${m.maxMs} ms</td></tr>`),
+      "No jobs finished yet.");
+    table($("workers"), [["Name"], ["Connection"], ["Queues"], ["Started"], ["State"]],
+      stats.workers.map((w) => `<tr><td>${esc(w.name)}</td><td>${esc(w.connection)}</td><td>${esc(w.queues)}</td><td>${ago(w.startedAt)}</td><td>${w.running ? "running" : "stopped"}</td></tr>`),
+      "No workers seen yet.");
+    $("updated").textContent = "updated " + new Date().toLocaleTimeString();
+  } catch (e) { $("updated").textContent = "cannot reach the dashboard API"; }
+}
+$("retryAll").onclick = () => send("POST", "/api/jobs/failed/retry-all");
+tabs(); refresh(); setInterval(refresh, 3000);
+</script>
+</body>
+</html>
+""";
+        }
+    }
+}
