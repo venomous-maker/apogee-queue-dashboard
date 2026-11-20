@@ -1,0 +1,269 @@
+// dashboard.grav — a dashboard for apogee-queue: what is waiting on each
+// queue, how many jobs finish a minute, how long each kind takes, what failed
+// (retry or forget it from the page), which workers run, and the latest jobs.
+//
+//   let dash = new QueueDashboard(queue, new RedisDashboardStore(RedisConnection.open(env("REDIS_URL"))))
+//   dash.attach(events)                        // the workers' process records (the queue's events)
+//   dash.routes(router, "queue-dashboard")     // the web app's process shows it: /queue-dashboard
+//   dash.gate(fn(req: Request) -> bool { return req.user != null && (req.user as User).isAdmin })
+//
+// By default only requests from this machine may see it.
+import "std"
+import "std/net"
+import "apogee-container"
+import "apogee-events"
+import "apogee-http"
+import "apogee-routing"
+import "apogee-queue"
+import "metrics.grav"
+import "page.grav"
+
+namespace apogee {
+
+    class QueueDashboard {
+        public queue: QueueManager
+        public store: DashboardStore
+        // Queues to show even before a job is seen on them ("connection|queue").
+        public watch: Array<string> = new Array<string>()
+        private allow: fn(Request) -> bool
+
+        constructor(queue: QueueManager, store: DashboardStore = new MemoryDashboardStore()) {
+            self.queue = queue;
+            self.store = store;
+            self.allow = fn(req: Request) -> bool { return QueueDashboard.local(req); };
+        }
+        // Who may see the dashboard (and retry or forget failed jobs).
+        fn gate(allow: fn(Request) -> bool) -> QueueDashboard { self.allow = allow; return self; }
+        fn watchQueue(connection: string, queue: string) -> QueueDashboard { self.watch.push(connection + "|" + queue); return self; }
+
+        // ── recording ──────────────────────────────────────────────────────────
+        // Records the queue's events from `events` (the queue manager's).
+        fn attach(events: Events) {
+            if (self.queue.events == null) { self.queue.events = events; }
+            events.listen::<JobQueued>(fn(e: JobQueued) { self.queued(e); });
+            events.listen::<JobProcessing>(fn(e: JobProcessing) { self.processing(e); });
+            events.listen::<JobProcessed>(fn(e: JobProcessed) { self.processed(e); });
+            events.listen::<JobReleased>(fn(e: JobReleased) { self.released(e); });
+            events.listen::<JobFailed>(fn(e: JobFailed) { self.failed(e); });
+            events.listen::<WorkerStarting>(fn(e: WorkerStarting) {
+                let w = new WorkerInfo(e.name);
+                w.connection = e.connection;
+                w.queues = e.queues;
+                w.startedAt = Time.nowMs();
+                self.store.workerStarted(w);
+            });
+            events.listen::<WorkerStopping>(fn(e: WorkerStopping) { self.store.workerStopped(e.name, Time.nowMs()); });
+        }
+        private fn record(e: QueueJobEvent) -> JobRecord {
+            let r = self.store.job(e.jobId);
+            if (r == null) {
+                r = new JobRecord(e.jobId);
+                r.queuedAt = Time.nowMs();
+            }
+            if (e.job != "") { r.job = QueueDashboard.shortName(e.job); }
+            if (e.connection != "") { r.connection = e.connection; }
+            if (e.queue != "") { r.queue = e.queue; }
+            return r;
+        }
+        fn queued(e: JobQueued) {
+            let r = self.record(e);
+            r.status = "queued";
+            self.store.saveJob(r);
+            self.store.noteQueue(e.connection, e.queue);
+        }
+        fn processing(e: JobProcessing) {
+            let r = self.record(e);
+            r.status = "processing";
+            r.attempts = e.attempts;
+            r.startedAt = Time.nowMs();
+            self.store.saveJob(r);
+            self.store.noteQueue(e.connection, e.queue);
+        }
+        fn processed(e: JobProcessed) {
+            let r = self.record(e);
+            r.status = "processed";
+            r.finishedAt = Time.nowMs();
+            r.ms = e.ms;
+            self.store.saveJob(r);
+            self.store.countMinute(Time.now() / 60, 1, 0);
+            self.store.countJob(r.job, e.ms, false);
+        }
+        fn released(e: JobReleased) {
+            let r = self.record(e);
+            r.status = "released";
+            self.store.saveJob(r);
+        }
+        fn failed(e: JobFailed) {
+            let r = self.record(e);
+            r.status = "failed";
+            r.finishedAt = Time.nowMs();
+            r.error = e.exception == null ? "" : e.exception.kind() + ": " + e.exception.message();
+            self.store.saveJob(r);
+            self.store.countMinute(Time.now() / 60, 0, 1);
+            self.store.countJob(r.job, 0, true);
+        }
+
+        // ── what the page shows ────────────────────────────────────────────────
+        // The headline numbers, the queues, and the workers.
+        fn stats() -> JsonValue {
+            let now = Time.now() / 60;
+            let hour = self.store.minutes(now - 59, now);
+            let processedHour: long = 0;
+            let failedHour: long = 0;
+            for (m in hour) { processedHour += m.processed; failedHour += m.failed; }
+            let lastMinute = hour[hour.size() - 1].processed + (hour.size() > 1 ? hour[hour.size() - 2].processed : 0);
+            let o = Json.object();
+            let running = 0;
+            let ws = Json.array();
+            for (w in self.store.workers()) {
+                if (w.running()) { running += 1; }
+                let j = Json.object();
+                j.set("name", w.name);
+                j.set("connection", w.connection);
+                j.set("queues", w.queues);
+                j.set("startedAt", w.startedAt);
+                j.set("running", w.running());
+                ws.push(j);
+            }
+            o.set("status", running > 0 ? "running" : "inactive");
+            o.set("jobsPerMinute", (lastMinute / 2) as long);
+            o.set("processedLastHour", processedHour);
+            o.set("failedLastHour", failedHour);
+            o.set("failedTotal", self.failedCount());
+            o.set("workers", ws);
+            o.set("queues", self.queueSizes());
+            return o;
+        }
+        private fn failedCount() -> long {
+            if (self.queue.failedJobs == null) { return 0; }
+            try { return self.queue.failedJobs.count(); } catch (e: Exception) { return 0; }
+        }
+        // Each known queue's waiting, delayed and reserved jobs.
+        fn queueSizes() -> JsonValue {
+            let names = new HashSet<string>();
+            for (q in self.store.queues()) { names.add(q); }
+            for (q in self.watch) { names.add(q); }
+            let sorted = names.toArray();
+            sorted.sortBy(fn(a, b) => Str.compare(a, b));
+            let out = Json.array();
+            for (q in sorted) {
+                let bar = Str.indexOf(q, "|");
+                if (bar < 0) { continue; }
+                let conn = q[..bar];
+                let name = q[bar + 1..];
+                let o = Json.object();
+                o.set("connection", conn);
+                o.set("queue", name);
+                if (self.queue.hasConnection(conn)) {
+                    let d = self.queue.connection(conn);
+                    try {
+                        o.set("waiting", d.size(name));
+                        o.set("delayed", d.delayedSize(name));
+                        o.set("reserved", d.reservedSize(name));
+                    } catch (e: Exception) { o.set("error", e.message()); }
+                }
+                out.push(o);
+            }
+            return out;
+        }
+        // Jobs finished per minute over the last `minutes`.
+        fn throughput(minutes: int = 60) -> JsonValue {
+            let now = Time.now() / 60;
+            let out = Json.array();
+            for (m in self.store.minutes(now - (minutes - 1) as long, now)) {
+                let o = Json.object();
+                o.set("minute", m.minute * 60);
+                o.set("processed", m.processed);
+                o.set("failed", m.failed);
+                out.push(o);
+            }
+            return out;
+        }
+        fn jobMetrics() -> JsonValue {
+            let out = Json.array();
+            for (m in self.store.jobMetrics()) {
+                let o = Json.object();
+                o.set("job", m.job);
+                o.set("processed", m.processed);
+                o.set("failed", m.failed);
+                o.set("averageMs", m.averageMs());
+                o.set("maxMs", m.maxMs);
+                out.push(o);
+            }
+            return out;
+        }
+        // The latest jobs (`status` "" for all).
+        fn recentJobs(limit: int = 50, status: string = "") -> JsonValue {
+            let out = Json.array();
+            for (r in self.store.recentJobs(status == "" ? limit : 1000)) {
+                if (status != "" && r.status != status) { continue; }
+                if (out.size() >= limit) { break; }
+                out.push(r.toJson());
+            }
+            return out;
+        }
+        fn failedJobs(limit: int = 100) -> JsonValue {
+            let out = Json.array();
+            if (self.queue.failedJobs == null) { return out; }
+            for (f in self.queue.failedJobs.all()) {
+                if (out.size() >= limit) { break; }
+                let o = Json.object();
+                o.set("id", f.id);
+                o.set("job", QueueDashboard.shortName(f.jobClass()));
+                o.set("connection", f.connection);
+                o.set("queue", f.queue);
+                o.set("failedAt", f.failedAt * 1000);
+                o.set("exception", f.exception);
+                out.push(o);
+            }
+            return out;
+        }
+
+        // ── the web side ───────────────────────────────────────────────────────
+        // The page and its JSON API under `prefix` on `router`.
+        fn routes(router: Router, prefix: string = "queue-dashboard") {
+            let p = "/" + Str.trim(Str.replace(prefix, "//", "/"));
+            while (Str.endsWith(p, "/") && p.length > 1) { p = p[..p.length - 1]; }
+            let base = p;
+            router.get(base, self.guard(fn(req: Request) -> Response { return Response.html(DashboardPage.html(base)); }));
+            router.get(base + "/api/stats", self.guard(fn(req: Request) -> Response { return QueueDashboard.json(self.stats()); }));
+            router.get(base + "/api/throughput", self.guard(fn(req: Request) -> Response {
+                return QueueDashboard.json(self.throughput(Integer.parseOr(req.query("minutes", "60"), 60) as int));
+            }));
+            router.get(base + "/api/metrics/jobs", self.guard(fn(req: Request) -> Response { return QueueDashboard.json(self.jobMetrics()); }));
+            router.get(base + "/api/jobs/recent", self.guard(fn(req: Request) -> Response {
+                return QueueDashboard.json(self.recentJobs(Integer.parseOr(req.query("limit", "50"), 50) as int, req.query("status", "")));
+            }));
+            router.get(base + "/api/jobs/failed", self.guard(fn(req: Request) -> Response { return QueueDashboard.json(self.failedJobs()); }));
+            router.post(base + "/api/jobs/failed/retry-all", self.guard(fn(req: Request) -> Response {
+                let n = self.queue.retryAll();
+                return Response.json({"retried": n});
+            }));
+            router.post(base + "/api/jobs/failed/{id}/retry", self.guard(fn(req: Request) -> Response {
+                return self.queue.retry(str(req.route("id"))) ? Response.json({"retried": true}) : Response.json({"message": "No such failed job."}, 404);
+            }));
+            router.delete(base + "/api/jobs/failed/{id}", self.guard(fn(req: Request) -> Response {
+                let ok = self.queue.failedJobs != null && self.queue.failedJobs.forget(str(req.route("id")));
+                return ok ? Response.json({"forgotten": true}) : Response.json({"message": "No such failed job."}, 404);
+            }));
+        }
+        private fn guard(h: fn(Request) -> Response) -> fn(Request) -> Response {
+            return fn(req: Request) -> Response {
+                let allow = self.allow;
+                if (!allow(req)) { return Response.json({"message": "Forbidden."}, 403); }
+                return h(req);
+            };
+        }
+        private static fn json(v: JsonValue) -> Response { return new Response(HttpResponse.json(200, v)); }
+        // Whether the request came from this machine.
+        static fn local(req: Request) -> bool {
+            let r = req.http.remote;
+            return Str.startsWith(r, "127.") || Str.startsWith(r, "[::1]") || Str.startsWith(r, "::1") || r == "";
+        }
+        // "SendInvoice" from "app.jobs.SendInvoice".
+        static fn shortName(name: string) -> string {
+            let dot = Str.lastIndexOf(name, ".");
+            return dot >= 0 ? name[dot + 1..] : name;
+        }
+    }
+}
