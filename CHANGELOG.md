@@ -6,6 +6,8 @@ compiler versions it builds with.
 
 ## Unreleased
 
+## 0.1.0 (2026-11-20)
+
 The first release. Needs grav 1.10.0 or newer.
 
 - `QueueDashboard`: records the queue's events (jobs queued, run, released
