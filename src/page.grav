@@ -18,28 +18,30 @@ namespace apogee {
 <title>Queue dashboard</title>
 <style>
 :root { --bg: #f6f7f9; --panel: #fff; --text: #1d2330; --muted: #6b7385; --line: #e3e6ec;
-        --accent: #3a63d8; --ok: #1e8e4a; --warn: #b7791f; --bad: #c53030; --bar: #3a63d8; --barbad: #e05252; }
+        --accent: #3a63d8; --ok: #1e8e4a; --warn: #b7791f; --bad: #c53030; --bar: #3a63d8; --barbad: #e05252; --code: #f1f3f7; }
 @media (prefers-color-scheme: dark) {
   :root { --bg: #11141a; --panel: #1a1f28; --text: #e6e9ef; --muted: #8e97a8; --line: #2a313d;
-          --accent: #7c9cf5; --ok: #48bb78; --warn: #ecc94b; --bad: #fc8181; --bar: #7c9cf5; --barbad: #fc8181; }
+          --accent: #7c9cf5; --ok: #48bb78; --warn: #ecc94b; --bad: #fc8181; --bar: #7c9cf5; --barbad: #fc8181; --code: #12161d; }
 }
 * { box-sizing: border-box; }
 body { margin: 0; background: var(--bg); color: var(--text); font: 14px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif; }
-header { display: flex; align-items: center; gap: 12px; padding: 18px 24px; border-bottom: 1px solid var(--line); background: var(--panel); }
+header { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; padding: 16px 24px; border-bottom: 1px solid var(--line); background: var(--panel); }
 header h1 { font-size: 18px; margin: 0; font-weight: 600; }
 .pill { padding: 2px 10px; border-radius: 999px; font-size: 12px; font-weight: 600; }
 .pill.running { background: color-mix(in srgb, var(--ok) 18%, transparent); color: var(--ok); }
-.pill.inactive { background: color-mix(in srgb, var(--warn) 18%, transparent); color: var(--warn); }
-.updated { margin-left: auto; color: var(--muted); font-size: 12px; }
-main { padding: 20px 24px; max-width: 1200px; margin: 0 auto; display: grid; gap: 20px; }
-.cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); gap: 14px; }
+.pill.inactive, .pill.paused { background: color-mix(in srgb, var(--warn) 18%, transparent); color: var(--warn); }
+.controls { display: flex; gap: 6px; margin-left: auto; align-items: center; }
+.updated { color: var(--muted); font-size: 12px; margin-right: 8px; }
+main { padding: 20px 24px; max-width: 1240px; margin: 0 auto; display: grid; gap: 20px; }
+.cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: 14px; }
 .card, section { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; }
 .card { padding: 14px 16px; }
 .card .label { color: var(--muted); font-size: 12px; text-transform: uppercase; letter-spacing: .04em; }
-.card .value { font-size: 26px; font-weight: 600; margin-top: 4px; font-variant-numeric: tabular-nums; }
+.card .value { font-size: 24px; font-weight: 600; margin-top: 4px; font-variant-numeric: tabular-nums; }
+.card .sub { color: var(--muted); font-size: 12px; }
 .card .value.bad { color: var(--bad); }
-section h2 { font-size: 14px; margin: 0; padding: 12px 16px; border-bottom: 1px solid var(--line); display: flex; align-items: center; gap: 8px; }
-section h2 .right { margin-left: auto; }
+section h2 { font-size: 14px; margin: 0; padding: 12px 16px; border-bottom: 1px solid var(--line); display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+section h2 .right { margin-left: auto; display: flex; gap: 6px; align-items: center; }
 .chart { padding: 12px 16px; }
 .chart svg { width: 100%; height: 120px; display: block; }
 table { width: 100%; border-collapse: collapse; }
@@ -47,23 +49,41 @@ th, td { text-align: left; padding: 8px 16px; border-bottom: 1px solid var(--lin
 th { color: var(--muted); font-weight: 500; font-size: 12px; }
 td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
 tr:last-child td { border-bottom: none; }
+tr.click { cursor: pointer; } tr.click:hover td { background: color-mix(in srgb, var(--accent) 6%, transparent); }
 .empty { padding: 16px; color: var(--muted); }
 .status { font-weight: 600; font-size: 12px; }
 .status.processed { color: var(--ok); } .status.failed { color: var(--bad); }
 .status.processing, .status.released { color: var(--warn); } .status.queued { color: var(--muted); }
 .err { color: var(--bad); font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; white-space: pre-wrap; max-height: 4.5em; overflow: hidden; }
+.tag { display: inline-block; font-size: 11px; padding: 0 6px; margin: 2px 4px 0 0; border-radius: 4px; background: var(--code); color: var(--muted); cursor: pointer; }
 button { font: inherit; font-size: 12px; padding: 4px 10px; border-radius: 6px; border: 1px solid var(--line); background: var(--panel); color: var(--text); cursor: pointer; }
 button:hover { border-color: var(--accent); color: var(--accent); }
 button.danger:hover { border-color: var(--bad); color: var(--bad); }
 .tabs button.on { border-color: var(--accent); color: var(--accent); }
+input { font: inherit; font-size: 12px; padding: 4px 8px; border-radius: 6px; border: 1px solid var(--line); background: var(--panel); color: var(--text); }
+.bar { height: 6px; border-radius: 3px; background: var(--line); overflow: hidden; min-width: 80px; }
+.bar > i { display: block; height: 100%; background: var(--ok); }
 .scroll { overflow-x: auto; }
+#detail { position: fixed; inset: 0 0 0 auto; width: min(640px, 100%); background: var(--panel); border-left: 1px solid var(--line);
+          box-shadow: -8px 0 24px rgba(0,0,0,.15); transform: translateX(105%); transition: transform .18s; display: flex; flex-direction: column; z-index: 10; }
+#detail.open { transform: none; }
+#detail .head { display: flex; align-items: center; padding: 14px 16px; border-bottom: 1px solid var(--line); gap: 8px; }
+#detail .body { padding: 16px; overflow: auto; }
+#detail dl { display: grid; grid-template-columns: 120px 1fr; gap: 6px 12px; margin: 0 0 16px; }
+#detail dt { color: var(--muted); } #detail dd { margin: 0; word-break: break-all; }
+pre { background: var(--code); padding: 12px; border-radius: 8px; overflow: auto; font-size: 12px; margin: 0; }
 </style>
 </head>
 <body>
 <header>
   <h1>Queue dashboard</h1>
   <span id="status" class="pill inactive">…</span>
-  <span class="updated" id="updated"></span>
+  <div class="controls">
+    <span class="updated" id="updated"></span>
+    <button id="pause">Pause workers</button>
+    <button id="continue">Continue</button>
+    <button id="restart">Restart workers</button>
+  </div>
 </header>
 <main>
   <div class="cards">
@@ -71,24 +91,34 @@ button.danger:hover { border-color: var(--bad); color: var(--bad); }
     <div class="card"><div class="label">Processed, last hour</div><div class="value" id="hour">–</div></div>
     <div class="card"><div class="label">Failed, last hour</div><div class="value" id="failedHour">–</div></div>
     <div class="card"><div class="label">Failed jobs kept</div><div class="value" id="failedTotal">–</div></div>
+    <div class="card"><div class="label">Longest wait</div><div class="value" id="maxWait">–</div><div class="sub" id="maxWaitQueue"></div></div>
     <div class="card"><div class="label">Workers running</div><div class="value" id="workersRunning">–</div></div>
   </div>
   <section><h2>Throughput, last hour</h2><div class="chart"><svg id="chart" viewBox="0 0 600 120" preserveAspectRatio="none" role="img" aria-label="Jobs per minute"></svg></div></section>
   <section><h2>Queues</h2><div class="scroll"><table id="queues"></table></div></section>
-  <section><h2>Recent jobs <span class="right tabs" id="tabs"></span></h2><div class="scroll"><table id="recent"></table></div></section>
+  <section><h2>Jobs <span class="right"><span class="tabs" id="tabs"></span>
+    <input id="tagSearch" placeholder="Search a tag (order:42)" size="22"> <button id="tagMonitor" title="Keep this tag's jobs">Monitor</button></span></h2>
+    <div class="scroll"><table id="recent"></table></div></section>
+  <section><h2>Monitored tags</h2><div class="scroll"><table id="tags"></table></div></section>
   <section><h2>Failed jobs <span class="right"><button id="retryAll">Retry all</button></span></h2><div class="scroll"><table id="failed"></table></div></section>
+  <section><h2>Batches</h2><div class="scroll"><table id="batches"></table></div></section>
   <section><h2>Jobs by class</h2><div class="scroll"><table id="metrics"></table></div></section>
   <section><h2>Workers</h2><div class="scroll"><table id="workers"></table></div></section>
 </main>
+<aside id="detail" aria-hidden="true"><div class="head"><strong id="detailTitle">Job</strong><span style="margin-left:auto"></span><button id="detailRetry" hidden>Retry</button><button id="detailClose">Close</button></div><div class="body" id="detailBody"></div></aside>
 <script>
 const base = "__BASE__";
-let filter = "";
+let filter = "", tag = "";
 const $ = (id) => document.getElementById(id);
 const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
 const ago = (ms) => { if (!ms) return "–"; const s = Math.max(0, Math.round((Date.now() - ms) / 1000));
   return s < 60 ? s + "s ago" : s < 3600 ? Math.round(s / 60) + "m ago" : s < 86400 ? Math.round(s / 3600) + "h ago" : Math.round(s / 86400) + "d ago"; };
+const dur = (ms) => ms == null || ms < 0 ? "–" : ms < 1000 ? ms + " ms" : ms < 60000 ? (ms / 1000).toFixed(1) + " s" : Math.round(ms / 60000) + " min";
+const secs = (s) => !s ? "0 s" : s < 60 ? s + " s" : s < 3600 ? Math.round(s / 60) + " min" : (s / 3600).toFixed(1) + " h";
 const get = (path) => fetch(base + path, { headers: { Accept: "application/json" } }).then((r) => r.json());
-const send = (method, path) => fetch(base + path, { method, headers: { Accept: "application/json", "X-Requested-With": "XMLHttpRequest" } }).then(refresh);
+const send = (method, path, body) => fetch(base + path, { method, headers: { Accept: "application/json", "Content-Type": "application/json", "X-Requested-With": "XMLHttpRequest" },
+  body: body ? JSON.stringify(body) : undefined }).then(refresh);
+const tagsHtml = (ts) => (ts || []).map((t) => `<span class="tag" data-tag="${esc(t)}">${esc(t)}</span>`).join("");
 function table(el, head, rows, empty) {
   if (!rows.length) { el.innerHTML = `<tr><td class="empty">${empty}</td></tr>`; return; }
   el.innerHTML = "<tr>" + head.map((h) => `<th class="${h[1] || ""}">${h[0]}</th>`).join("") + "</tr>" + rows.join("");
@@ -103,43 +133,87 @@ function chart(points) {
   }).join("");
 }
 function tabs() {
-  $("tabs").innerHTML = ["", "processing", "processed", "failed"].map((s) =>
-    `<button class="${s === filter ? "on" : ""}" data-s="${s}">${s || "all"}</button>`).join(" ");
-  $("tabs").querySelectorAll("button").forEach((b) => b.onclick = () => { filter = b.dataset.s; tabs(); refresh(); });
+  $("tabs").innerHTML = ["", "queued", "processing", "processed", "failed"].map((s) =>
+    `<button class="${s === filter && !tag ? "on" : ""}" data-s="${s}">${s || "recent"}</button>`).join(" ");
+  $("tabs").querySelectorAll("button").forEach((b) => b.onclick = () => { filter = b.dataset.s; tag = ""; $("tagSearch").value = ""; tabs(); refresh(); });
+}
+async function detail(kind, id) {
+  const j = await get(kind === "failed" ? "/api/jobs/failed/" + encodeURIComponent(id) : "/api/jobs/" + encodeURIComponent(id));
+  if (j.message) return;
+  $("detailTitle").textContent = j.job || "Job";
+  const rows = kind === "failed"
+    ? [["Queue", j.connection + " / " + j.queue], ["Failed", ago(j.failedAt)], ["Tags", tagsHtml(j.tags) || "–"]]
+    : [["Status", `<span class="status ${esc(j.status)}">${esc(j.status)}</span>`], ["Queue", esc(j.connection + " / " + j.queue)], ["Attempts", j.attempts],
+       ["Queued", ago(j.queuedAt)], ["Waited", dur(j.waitMs)], ["Ran for", dur(j.ms)], ["Tags", tagsHtml(j.tags) || "–"], ["Batch", esc(j.batchId) || "–"]];
+  $("detailBody").innerHTML = `<dl>${rows.map((r) => `<dt>${r[0]}</dt><dd>${r[1]}</dd>`).join("")}</dl>` +
+    ((j.error || j.exception) ? `<h3>Exception</h3><pre class="err" style="max-height:none">${esc(j.error || j.exception)}</pre>` : "") +
+    `<h3>Payload</h3><pre>${esc(j.payloadPretty || j.payload || "(not recorded)")}</pre>`;
+  $("detailRetry").hidden = kind !== "failed";
+  $("detailRetry").onclick = () => { send("POST", "/api/jobs/failed/" + encodeURIComponent(id) + "/retry"); close(); };
+  $("detail").classList.add("open"); $("detail").setAttribute("aria-hidden", "false");
+}
+function close() { $("detail").classList.remove("open"); $("detail").setAttribute("aria-hidden", "true"); }
+function bindRows() {
+  document.querySelectorAll("tr[data-job]").forEach((tr) => tr.onclick = (e) => { if (e.target.closest("button,.tag")) return; detail(tr.dataset.kind, tr.dataset.job); });
+  document.querySelectorAll(".tag[data-tag]").forEach((s) => s.onclick = () => { tag = s.dataset.tag; $("tagSearch").value = tag; close(); tabs(); refresh(); });
+  document.querySelectorAll("[data-retry]").forEach((b) => b.onclick = () => send("POST", "/api/jobs/failed/" + encodeURIComponent(b.dataset.retry) + "/retry"));
+  document.querySelectorAll("[data-forget]").forEach((b) => b.onclick = () => send("DELETE", "/api/jobs/failed/" + encodeURIComponent(b.dataset.forget)));
+  document.querySelectorAll("[data-unmonitor]").forEach((b) => b.onclick = () => send("DELETE", "/api/tags/" + encodeURIComponent(b.dataset.unmonitor)));
 }
 async function refresh() {
   try {
-    const [stats, points, recent, failed, metrics] = await Promise.all([
-      get("/api/stats"), get("/api/throughput"), get("/api/jobs/recent?limit=25&status=" + filter), get("/api/jobs/failed"), get("/api/metrics/jobs")]);
+    const jobsPath = tag ? "/api/jobs/tagged/" + encodeURIComponent(tag) + "?limit=50" : "/api/jobs/recent?limit=25&status=" + filter;
+    const [stats, points, recent, failed, metrics, batches, tags] = await Promise.all([
+      get("/api/stats"), get("/api/throughput"), get(jobsPath), get("/api/jobs/failed"), get("/api/metrics/jobs"), get("/api/batches"), get("/api/tags")]);
     $("status").textContent = stats.status; $("status").className = "pill " + stats.status;
     $("jpm").textContent = stats.jobsPerMinute; $("hour").textContent = stats.processedLastHour;
     $("failedHour").textContent = stats.failedLastHour; $("failedHour").className = "value" + (stats.failedLastHour ? " bad" : "");
     $("failedTotal").textContent = stats.failedTotal;
+    $("maxWait").textContent = secs(stats.maxWaitSeconds); $("maxWaitQueue").textContent = stats.maxWaitQueue || "";
     $("workersRunning").textContent = stats.workers.filter((w) => w.running).length;
+    $("pause").hidden = stats.paused; $("continue").hidden = !stats.paused;
     chart(points);
-    table($("queues"), [["Connection"], ["Queue"], ["Waiting", "num"], ["Delayed", "num"], ["Reserved", "num"]],
-      stats.queues.map((q) => `<tr><td>${esc(q.connection)}</td><td>${esc(q.queue)}</td><td class="num">${q.waiting ?? "–"}</td><td class="num">${q.delayed ?? "–"}</td><td class="num">${q.reserved ?? "–"}</td></tr>`),
+    table($("queues"), [["Connection"], ["Queue"], ["Waiting", "num"], ["Delayed", "num"], ["Reserved", "num"], ["Avg wait", "num"], ["Avg run", "num"],
+                        ["Est. wait", "num"], ["Workers", "num"], ["Processed", "num"], ["Failed", "num"]],
+      stats.queues.map((q) => `<tr><td>${esc(q.connection)}</td><td>${esc(q.queue)}</td><td class="num">${q.waiting ?? "–"}</td><td class="num">${q.delayed ?? "–"}</td>` +
+        `<td class="num">${q.reserved ?? "–"}</td><td class="num">${dur(q.averageWaitMs)}</td><td class="num">${dur(q.averageRunMs)}</td>` +
+        `<td class="num">${secs(q.estimatedWaitSeconds)}</td><td class="num">${q.workers}</td><td class="num">${q.processed}</td><td class="num">${q.failed}</td></tr>`),
       "No queues seen yet.");
-    table($("recent"), [["Job"], ["Queue"], ["Status"], ["Attempts", "num"], ["Runtime", "num"], ["When"]],
-      recent.map((j) => `<tr><td>${esc(j.job)}<div class="err">${esc(j.error)}</div></td><td>${esc(j.queue)}</td><td><span class="status ${esc(j.status)}">${esc(j.status)}</span></td>` +
-        `<td class="num">${j.attempts}</td><td class="num">${j.ms ? j.ms + " ms" : "–"}</td><td>${ago(j.finishedAt || j.startedAt || j.queuedAt)}</td></tr>`),
-      "No jobs yet.");
+    table($("recent"), [["Job"], ["Queue"], ["Status"], ["Attempts", "num"], ["Waited", "num"], ["Runtime", "num"], ["When"]],
+      recent.map((j) => `<tr class="click" data-kind="job" data-job="${esc(j.id)}"><td>${esc(j.job)}<div>${tagsHtml(j.tags)}</div><div class="err">${esc(j.error)}</div></td>` +
+        `<td>${esc(j.queue)}</td><td><span class="status ${esc(j.status)}">${esc(j.status)}</span></td>` +
+        `<td class="num">${j.attempts}</td><td class="num">${dur(j.waitMs)}</td><td class="num">${j.ms ? dur(j.ms) : "–"}</td><td>${ago(j.finishedAt || j.startedAt || j.queuedAt)}</td></tr>`),
+      tag ? "No jobs with this tag." : "No jobs yet.");
+    table($("tags"), [["Tag"], ["Jobs kept", "num"], [""]],
+      tags.map((t) => `<tr><td><span class="tag" data-tag="${esc(t.tag)}">${esc(t.tag)}</span></td><td class="num">${t.jobs}</td>` +
+        `<td><button class="danger" data-unmonitor="${esc(t.tag)}">Stop monitoring</button></td></tr>`),
+      "No monitored tags. Search a tag above and Monitor it to keep its jobs.");
     table($("failed"), [["Job"], ["Queue"], ["Failed"], ["Exception"], [""]],
-      failed.map((f) => `<tr><td>${esc(f.job)}</td><td>${esc(f.queue)}</td><td>${ago(f.failedAt)}</td><td><div class="err">${esc(f.exception)}</div></td>` +
-        `<td><button data-retry="${esc(f.id)}">Retry</button> <button class="danger" data-forget="${esc(f.id)}">Forget</button></td></tr>`),
+      failed.map((f) => `<tr class="click" data-kind="failed" data-job="${esc(f.id)}"><td>${esc(f.job)}<div>${tagsHtml(f.tags)}</div></td><td>${esc(f.queue)}</td><td>${ago(f.failedAt)}</td>` +
+        `<td><div class="err">${esc(f.exception)}</div></td><td><button data-retry="${esc(f.id)}">Retry</button> <button class="danger" data-forget="${esc(f.id)}">Forget</button></td></tr>`),
       "No failed jobs.");
-    document.querySelectorAll("[data-retry]").forEach((b) => b.onclick = () => send("POST", "/api/jobs/failed/" + encodeURIComponent(b.dataset.retry) + "/retry"));
-    document.querySelectorAll("[data-forget]").forEach((b) => b.onclick = () => send("DELETE", "/api/jobs/failed/" + encodeURIComponent(b.dataset.forget)));
+    table($("batches"), [["Batch"], ["Progress"], ["Jobs", "num"], ["Pending", "num"], ["Failed", "num"], ["Created"], ["State"]],
+      batches.map((b) => `<tr><td>${esc(b.name || b.id)}</td><td><div class="bar"><i style="width:${b.progress}%"></i></div></td><td class="num">${b.total}</td>` +
+        `<td class="num">${b.pending}</td><td class="num">${b.failed}</td><td>${ago(b.createdAt)}</td><td>${b.cancelled ? "cancelled" : (b.finishedAt ? "finished" : "running")}</td></tr>`),
+      "No batches seen yet.");
     table($("metrics"), [["Job"], ["Processed", "num"], ["Failed", "num"], ["Average", "num"], ["Slowest", "num"]],
-      metrics.map((m) => `<tr><td>${esc(m.job)}</td><td class="num">${m.processed}</td><td class="num">${m.failed}</td><td class="num">${m.averageMs} ms</td><td class="num">${m.maxMs} ms</td></tr>`),
+      metrics.map((m) => `<tr><td>${esc(m.job)}</td><td class="num">${m.processed}</td><td class="num">${m.failed}</td><td class="num">${dur(m.averageMs)}</td><td class="num">${dur(m.maxMs)}</td></tr>`),
       "No jobs finished yet.");
     table($("workers"), [["Name"], ["Connection"], ["Queues"], ["Started"], ["State"]],
-      stats.workers.map((w) => `<tr><td>${esc(w.name)}</td><td>${esc(w.connection)}</td><td>${esc(w.queues)}</td><td>${ago(w.startedAt)}</td><td>${w.running ? "running" : "stopped"}</td></tr>`),
+      stats.workers.map((w) => `<tr><td>${esc(w.name)}</td><td>${esc(w.connection)}</td><td>${esc(w.queues)}</td><td>${ago(w.startedAt)}</td><td>${w.running ? (stats.paused ? "paused" : "running") : "stopped"}</td></tr>`),
       "No workers seen yet.");
+    bindRows();
     $("updated").textContent = "updated " + new Date().toLocaleTimeString();
   } catch (e) { $("updated").textContent = "cannot reach the dashboard API"; }
 }
 $("retryAll").onclick = () => send("POST", "/api/jobs/failed/retry-all");
+$("pause").onclick = () => send("POST", "/api/workers/pause");
+$("continue").onclick = () => send("POST", "/api/workers/continue");
+$("restart").onclick = () => { if (confirm("Restart every worker after its current job?")) send("POST", "/api/workers/restart"); };
+$("detailClose").onclick = close;
+$("tagSearch").onkeydown = (e) => { if (e.key === "Enter") { tag = e.target.value.trim(); filter = ""; tabs(); refresh(); } };
+$("tagMonitor").onclick = () => { const t = $("tagSearch").value.trim(); if (t) send("POST", "/api/tags", { tag: t }); };
+document.addEventListener("keydown", (e) => { if (e.key === "Escape") close(); });
 tabs(); refresh(); setInterval(refresh, 3000);
 </script>
 </body>
