@@ -1,8 +1,10 @@
 // apogee-queue-dashboard's tests: jobs run by a real worker are recorded
-// (processed, failed, run times, workers, queues), the page and its JSON API
-// answer through apogee-testing's client, failed jobs are retried and
-// forgotten from it, the gate keeps others out, and the Redis store does what
-// the memory one does (REDIS_URL, default redis://127.0.0.1:6379/9).
+// (processed, failed, run and wait times, tags, batches, workers, queues) the
+// same way by the memory, Redis and database (SQLite) stores; the page and its
+// JSON API answer through apogee-testing's client: job detail, tag search and
+// monitored tags, failed jobs retried and forgotten, batches, pausing workers;
+// alerts on long waits; silenced jobs; and the gate. The Redis store's test
+// needs a server (REDIS_URL, default redis://127.0.0.1:6379/9).
 import "std"
 import "apogee-container"
 import "apogee-events"
@@ -11,18 +13,25 @@ import "apogee-routing"
 import "apogee-queue"
 import "apogee-testing"
 import "grav-redis"
+import "grav-db"
 import "../src/all.grav"
 use apogee.*
 use redis.*
+use db.*
 
 class SendInvoice extends Job {
     public n: int = 0
     constructor(n: int = 0) { self.n = n }
+    fn tags() -> Array<string> { return ["invoice:" + str(self.n), "billing"] }
     fn handle() { Time.sleepMs(2) }
 }
 class Explodes extends Job {
     constructor() { self.tries = 1 }
     fn handle() { throw new StateError("the printer is on fire") }
+}
+class Heartbeat extends Job {
+    constructor() {}
+    fn handle() {}
 }
 
 fn setup(store: DashboardStore) -> QueueDashboard {
@@ -31,48 +40,74 @@ fn setup(store: DashboardStore) -> QueueDashboard {
     q.addConnection("memory", new MemoryQueueDriver())
     q.defaultConnection = "memory"
     let d = new QueueDashboard(q, store)
+    d.silence("Heartbeat")
     d.attach(new Events(c))
     return d
 }
 
-fn run(d: QueueDashboard) {
-    for (i in 0..3) { d.queue.dispatch(new SendInvoice(i)) }
-    d.queue.dispatch(new Explodes())
-    d.queue.dispatch(new SendInvoice(9).onQueue("mail"))
+fn work(d: QueueDashboard, queues: Array<string>) {
     let o = new WorkerOptions()
     o.sleep = 0.05
     o.memoryMb = 0
     o.stopWhenEmpty = true
     o.name = "worker-1"
-    d.queue.worker().work("memory", ["default", "mail"], o)
+    d.queue.worker().work("memory", queues, o)
+}
+
+fn run(d: QueueDashboard) {
+    d.store.monitor("billing")
+    for (i in 0..3) { d.queue.dispatch(new SendInvoice(i)) }
+    d.queue.dispatch(new Explodes())
+    d.queue.dispatch(new SendInvoice(9).onQueue("mail"))
+    d.queue.dispatch(new Heartbeat())
+    d.queue.batch([new SendInvoice(20), new SendInvoice(21)] as Array<Job>).name("month end").dispatch()
+    Time.sleepMs(20)                                    // (so the waits are not all zero)
+    work(d, ["default", "mail"])
 }
 
 fn checks(d: QueueDashboard) {
     let s = d.stats()
-    assertEq(s.get("processedLastHour").asInt(), 4)
+    assertEq(s.get("processedLastHour").asInt(), 7)     // 3 + 1 + heartbeat + 2 in the batch
     assertEq(s.get("failedLastHour").asInt(), 1)
     assertEq(s.get("failedTotal").asInt(), 1)
-    assertEq(s.get("status").asString(), "inactive")            // the worker stopped when the queues were empty
+    assertEq(s.get("status").asString(), "inactive")
     assertEq(s.get("workers").at(0).get("name").asString(), "worker-1")
     let queues = s.get("queues")
     assertEq(queues.size(), 2)
-    assertEq(queues.at(0).get("queue").asString(), "default")
-    assertEq(queues.at(0).get("waiting").asInt(), 0)
+    let q0 = queues.at(0)
+    assertEq(q0.get("queue").asString(), "default")
+    assertEq(q0.get("waiting").asInt(), 0)
+    assertEq(q0.get("processed").asInt(), 6)
+    assert(q0.get("averageWaitMs").asInt() >= 15)
+    assert(q0.get("averageRunMs").asInt() >= 1)
     let metrics = d.jobMetrics()
-    assertEq(metrics.size(), 2)
+    assertEq(metrics.size(), 3)
     assertEq(metrics.at(0).get("job").asString(), "Explodes")
     assertEq(metrics.at(0).get("failed").asInt(), 1)
-    assertEq(metrics.at(1).get("job").asString(), "SendInvoice")
-    assertEq(metrics.at(1).get("processed").asInt(), 4)
-    assert(metrics.at(1).get("maxMs").asInt() >= 2)
-    let recent = d.recentJobs(10)
-    assertEq(recent.size(), 5)
-    assertEq(recent.at(0).get("queue").asString(), "mail")
-    assertEq(d.recentJobs(10, "failed").size(), 1)
-    assert(Str.contains(d.recentJobs(10, "failed").at(0).get("error").asString(), "the printer is on fire"))
+    assertEq(metrics.at(2).get("job").asString(), "SendInvoice")
+    assertEq(metrics.at(2).get("processed").asInt(), 6)
+    // the heartbeat is counted, but silenced in the list
+    let recent = d.recentJobs(20)
+    assertEq(recent.size(), 7)
+    for (r in recent.asArray()) { assert(r.get("job").asString() != "Heartbeat") }
+    assertEq(d.recentJobs(20, "failed").size(), 1)
+    assert(Str.contains(d.recentJobs(20, "failed").at(0).get("error").asString(), "the printer is on fire"))
+    // tags: searched in the recent jobs, kept for a monitored one
+    assertEq(d.jobsWithTag("invoice:9").size(), 1)
+    assertEq(d.jobsWithTag("billing").size(), 6)
+    assertEq(d.tags().at(0).get("jobs").asInt(), 6)
+    // detail, with the payload
+    let one = d.jobsWithTag("invoice:2").at(0)
+    let detail = d.jobDetail(one.get("id").asString())
+    assert(Str.contains(detail.get("payloadPretty").asString(), "\"n\": 2"))
+    assert(detail.get("waitMs").asInt() >= 15)
+    // batches
+    let b = d.batches()
+    assertEq(b.size(), 1)
+    assertEq(b.at(0).get("name").asString(), "month end")
+    assertEq(b.at(0).get("progress").asInt(), 100)
     let minutes = d.throughput(5)
-    assertEq(minutes.size(), 5)
-    assertEq(minutes.at(4).get("processed").asInt() + minutes.at(3).get("processed").asInt(), 4)
+    assertEq(minutes.at(4).get("processed").asInt() + minutes.at(3).get("processed").asInt(), 7)
 }
 
 fn app(d: QueueDashboard) -> HttpKernel {
@@ -81,10 +116,39 @@ fn app(d: QueueDashboard) -> HttpKernel {
     return new HttpKernel(r)
 }
 
-test "jobs run by a worker are recorded" {
+test "the memory store" {
     let d = setup(new MemoryDashboardStore())
     run(d)
     checks(d)
+}
+
+test "the database store (SQLite)" {
+    let file = Dir.temp() + "/qd_test_" + str(Process.pid()) + ".sqlite"
+    new File(file).delete()
+    let pool = new Pool(4, fn() -> Connection { return Sqlite.open(file) })
+    let store = new DatabaseDashboardStore(pool)
+    store.createTables()
+    store.createTables()                                // (again: nothing happens)
+    let d = setup(store)
+    run(d)
+    checks(d)
+    store.clear()
+    assertEq(store.recentJobs(10).size(), 0)
+    new File(file).delete()
+}
+
+test "the Redis store, shared between connections" {
+    let url = env("REDIS_URL") == "" ? "redis://127.0.0.1:6379/9" : env("REDIS_URL")
+    let store = new RedisDashboardStore(RedisConnection.open(url), "qd-test-" + str(Process.pid()) + ":")
+    store.clear()
+    let d = setup(store)
+    run(d)
+    checks(d)
+    let other = new RedisDashboardStore(RedisConnection.open(url), store.prefix)
+    assertEq(other.recentJobs(10).size(), 7)
+    assertEq(other.jobMetrics().size(), 3)
+    store.clear()
+    assertEq(other.recentJobs(10).size(), 0)
 }
 
 test "the page and its JSON API" {
@@ -92,24 +156,47 @@ test "the page and its JSON API" {
     run(d)
     let c = new TestClient(app(d))
     c.get("/queue-dashboard").assertOk().assertSee("<title>Queue dashboard</title>").assertSee("const base = \"/queue-dashboard\"")
-    c.getJson("/queue-dashboard/api/stats").assertOk().assertJsonPath("processedLastHour", 4).assertJsonPath("failedTotal", 1)
-    c.getJson("/queue-dashboard/api/metrics/jobs").assertJsonCount(2).assertJsonPath("1.job", "SendInvoice")
-    c.getJson("/queue-dashboard/api/jobs/recent?status=failed").assertJsonCount(1).assertJsonPath("0.job", "Explodes")
-    c.getJson("/queue-dashboard/api/throughput?minutes=10").assertJsonCount(10)
+    c.getJson("/queue-dashboard/api/stats").assertOk().assertJsonPath("processedLastHour", 7).assertJsonPath("paused", false)
+    c.getJson("/queue-dashboard/api/metrics/queues").assertJsonCount(2).assertJsonPath("0.queue", "default")
+    c.getJson("/queue-dashboard/api/jobs/tagged/invoice%3A9").assertJsonCount(1).assertJsonPath("0.job", "SendInvoice")
+    let rec = c.getJson("/queue-dashboard/api/jobs/recent?limit=3").assertJsonCount(3)
+    c.getJson("/queue-dashboard/api/jobs/" + rec.jsonAt("0.id").asString()).assertOk().assertJsonPath("job", "SendInvoice")
+    c.getJson("/queue-dashboard/api/jobs/no-such-job").assertNotFound()
+    c.getJson("/queue-dashboard/api/batches").assertJsonCount(1).assertJsonPath("0.total", 2)
+    c.postJson("/queue-dashboard/api/tags", {"tag": "invoice:1"}).assertOk()
+    c.getJson("/queue-dashboard/api/tags").assertJsonCount(2)
+    c.deleteJson("/queue-dashboard/api/tags/invoice%3A1").assertOk()
+    c.getJson("/queue-dashboard/api/tags").assertJsonCount(1)
+    // failed jobs
     let failed = c.getJson("/queue-dashboard/api/jobs/failed").assertJsonCount(1).assertJsonPath("0.job", "Explodes")
     let id = failed.jsonAt("0.id").asString()
+    c.getJson("/queue-dashboard/api/jobs/failed/" + id).assertOk()
     c.postJson("/queue-dashboard/api/jobs/failed/" + id + "/retry", null).assertOk().assertJsonPath("retried", true)
-    assertEq(d.queue.size("default"), 1)                         // back on its queue
+    assertEq(d.queue.size("default"), 1)
     c.getJson("/queue-dashboard/api/jobs/failed").assertJsonCount(0)
-    d.queue.dispatch(new Explodes())
-    let o = new WorkerOptions()
-    o.memoryMb = 0
-    o.stopWhenEmpty = true
-    d.queue.worker().work("memory", ["default"], o)
-    let again = c.getJson("/queue-dashboard/api/jobs/failed").assertJsonCount(2)
+    work(d, ["default"])
+    let again = c.getJson("/queue-dashboard/api/jobs/failed").assertJsonCount(1)
     c.deleteJson("/queue-dashboard/api/jobs/failed/" + again.jsonAt("0.id").asString()).assertOk()
     c.deleteJson("/queue-dashboard/api/jobs/failed/nope").assertNotFound()
-    c.postJson("/queue-dashboard/api/jobs/failed/retry-all", null).assertOk().assertJsonPath("retried", 1)
+    // pausing workers
+    c.postJson("/queue-dashboard/api/workers/pause", null).assertOk()
+    c.getJson("/queue-dashboard/api/stats").assertJsonPath("status", "paused")
+    assert(Worker.isPausedIn(d.queue.cache))
+    c.postJson("/queue-dashboard/api/workers/continue", null).assertOk()
+    c.getJson("/queue-dashboard/api/stats").assertJsonPath("paused", false)
+}
+
+test "an alert when a queue's wait grows too long" {
+    let d = setup(new MemoryDashboardStore())
+    run(d)                                              // (gives the queue an average run time)
+    let alerts = new Array<LongWait>()
+    d.alertWhenWaitExceeds(1, fn(w: LongWait) { alerts.push(w) })
+    for (i in 0..2000) { d.queue.dispatch(new SendInvoice(i)) }
+    let sent = d.checkWaits()
+    assertEq(sent.size(), 1)
+    assertEq(alerts[0].queue, "default")
+    assert(alerts[0].seconds >= 1)
+    assertEq(d.checkWaits().size(), 0)                  // not again within five minutes
 }
 
 test "only this machine, unless the gate says otherwise" {
@@ -120,19 +207,4 @@ test "only this machine, unless the gate says otherwise" {
     d.gate(fn(req: Request) -> bool { return req.header("X-Admin") == "yes" })
     c.getJson("/queue-dashboard/api/stats").assertForbidden()
     c.withHeader("X-Admin", "yes").getJson("/queue-dashboard/api/stats").assertOk()
-}
-
-test "the Redis store keeps what the memory one does" {
-    let url = env("REDIS_URL") == "" ? "redis://127.0.0.1:6379/9" : env("REDIS_URL")
-    let store = new RedisDashboardStore(RedisConnection.open(url), "qd-test-" + str(Process.pid()) + ":")
-    store.clear()
-    let d = setup(store)
-    run(d)
-    checks(d)
-    // a second process sees the same through its own connection
-    let other = new RedisDashboardStore(RedisConnection.open(url), store.prefix)
-    assertEq(other.recentJobs(10).size(), 5)
-    assertEq(other.jobMetrics().size(), 2)
-    store.clear()
-    assertEq(other.recentJobs(10).size(), 0)
 }
