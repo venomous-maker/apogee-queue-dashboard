@@ -1,13 +1,38 @@
-// metrics.grav — what the queue dashboard knows, and where it keeps it: the
-// recent jobs, jobs per minute, each job class's counts and run times, the
-// workers, and the queues seen. Workers usually run in other processes than
-// the web app showing the dashboard, so the store can be Redis (they all write
-// to it, the dashboard reads it); MemoryDashboardStore is for one process.
+// metrics.grav — what the queue dashboard knows, and the shapes it is kept in:
+// job records, jobs per minute, totals per job class and per queue (run and
+// wait times), workers, queues, batches, and monitored tags. Each job event
+// becomes one DashboardEvent, which a store applies in one step (one lock, one
+// Redis round trip, one database transaction).
 import "std"
-import "grav-redis"
-use redis.*
 
 namespace apogee {
+
+    // One thing that happened to a job, as the store applies it.
+    class DashboardEvent {
+        // "queued", "processing", "processed", "released", "failed"
+        public kind: string
+        public jobId: string
+        public job: string = ""
+        public connection: string = ""
+        public queue: string = ""
+        // Unix milliseconds it happened.
+        public at: long = 0
+        // When it was queued (from its payload; 0 when unknown).
+        public queuedAt: long = 0
+        public attempts: int = 0
+        // How long it ran (processed).
+        public runMs: long = 0
+        // How long it waited before starting (processing; -1 when unknown).
+        public waitMs: long = -1
+        public error: string = ""
+        public tags: Array<string> = new Array<string>()
+        public payload: string = ""
+        public batchId: string = ""
+        // Kept out of the recent jobs (still counted): a silenced job class.
+        public silenced: bool = false
+        constructor(kind: string, jobId: string) { self.kind = kind; self.jobId = jobId; }
+        fn queueKey() -> string { return self.connection + "|" + self.queue; }
+    }
 
     // One job as the dashboard saw it.
     class JobRecord {
@@ -23,10 +48,51 @@ namespace apogee {
         public startedAt: long = 0
         public finishedAt: long = 0
         public ms: long = 0
+        public waitMs: long = -1
         public error: string = ""
+        public tags: Array<string> = new Array<string>()
+        public payload: string = ""
+        public batchId: string = ""
         constructor(id: string) { self.id = id; }
 
-        fn toJson() -> JsonValue {
+        private static fn rank(status: string) -> int {
+            switch (status) {
+                case "queued": return 0
+                case "processing", "released": return 1
+                default: return 2
+            }
+        }
+        // Folds `e` in (events from several processes may arrive out of order: a
+        // record never goes back from a later state to "queued").
+        fn apply(e: DashboardEvent) {
+            if (e.job != "") { self.job = e.job; }
+            if (e.connection != "") { self.connection = e.connection; }
+            if (e.queue != "") { self.queue = e.queue; }
+            if (e.payload != "") { self.payload = e.payload; }
+            if (e.batchId != "") { self.batchId = e.batchId; }
+            if (e.tags.size() > 0) { self.tags = e.tags; }
+            if (e.queuedAt > 0 && self.queuedAt == 0) { self.queuedAt = e.queuedAt; }
+            switch (e.kind) {
+                case "queued": {
+                    if (self.queuedAt == 0) { self.queuedAt = e.at; }
+                    if (JobRecord.rank(self.status) == 0) { self.status = "queued"; }
+                }
+                case "processing": {
+                    if (e.attempts >= self.attempts) {
+                        self.status = "processing";
+                        self.attempts = e.attempts;
+                        self.startedAt = e.at;
+                        if (e.waitMs >= 0) { self.waitMs = e.waitMs; }
+                    }
+                }
+                case "released": { if (self.status != "processed" && self.status != "failed") { self.status = "released"; } }
+                case "processed": { self.status = "processed"; self.finishedAt = e.at; self.ms = e.runMs; }
+                case "failed": { self.status = "failed"; self.finishedAt = e.at; self.error = e.error; }
+                default: {}
+            }
+        }
+
+        fn toJson(withPayload: bool = true) -> JsonValue {
             let o = Json.object();
             o.set("id", self.id);
             o.set("job", self.job);
@@ -38,7 +104,13 @@ namespace apogee {
             o.set("startedAt", self.startedAt);
             o.set("finishedAt", self.finishedAt);
             o.set("ms", self.ms);
+            o.set("waitMs", self.waitMs);
             o.set("error", self.error);
+            let t = Json.array();
+            for (x in self.tags) { t.push(x); }
+            o.set("tags", t);
+            o.set("batchId", self.batchId);
+            if (withPayload) { o.set("payload", self.payload); }
             return o;
         }
         static fn fromJson(j: JsonValue) -> JobRecord {
@@ -52,9 +124,14 @@ namespace apogee {
             r.startedAt = j.getLong("startedAt", 0);
             r.finishedAt = j.getLong("finishedAt", 0);
             r.ms = j.getLong("ms", 0);
+            r.waitMs = j.getLong("waitMs", -1);
             r.error = j.getString("error", "");
+            if (j.has("tags") && j.get("tags").isArray()) { for (t in j.get("tags").asArray()) { r.tags.push(t.asString()); } }
+            r.payload = j.getString("payload", "");
+            r.batchId = j.getString("batchId", "");
             return r;
         }
+        fn hasTag(tag: string) -> bool { return self.tags.contains(tag); }
     }
 
     // Jobs finished in one minute.
@@ -76,6 +153,20 @@ namespace apogee {
         fn averageMs() -> long { return self.processed == 0 ? 0 : self.totalMs / self.processed; }
     }
 
+    // A queue's totals ("connection|queue").
+    class QueueMetric {
+        public queue: string
+        public processed: long = 0
+        public failed: long = 0
+        public totalRunMs: long = 0
+        public totalWaitMs: long = 0
+        public waits: long = 0
+        public maxWaitMs: long = 0
+        constructor(queue: string) { self.queue = queue; }
+        fn averageRunMs() -> long { return self.processed == 0 ? 0 : self.totalRunMs / self.processed; }
+        fn averageWaitMs() -> long { return self.waits == 0 ? 0 : self.totalWaitMs / self.waits; }
+    }
+
     class WorkerInfo {
         public name: string
         public connection: string = ""
@@ -84,61 +175,151 @@ namespace apogee {
         public stoppedAt: long = 0      // 0: running
         constructor(name: string) { self.name = name; }
         fn running() -> bool { return self.stoppedAt == 0; }
+        fn toJson() -> string {
+            let o = Json.object();
+            o.set("connection", self.connection);
+            o.set("queues", self.queues);
+            o.set("startedAt", self.startedAt);
+            o.set("stoppedAt", self.stoppedAt);
+            return o.toJson();
+        }
+        static fn fromJson(name: string, text: string) -> WorkerInfo {
+            let o = Json.parse(text);
+            let w = new WorkerInfo(name);
+            w.connection = o.getString("connection", "");
+            w.queues = o.getString("queues", "");
+            w.startedAt = o.getLong("startedAt", 0);
+            w.stoppedAt = o.getLong("stoppedAt", 0);
+            return w;
+        }
     }
 
     interface DashboardStore {
-        // Adds or replaces a job record (by id); the store keeps the newest `keep`.
-        fn saveJob(r: JobRecord)
+        // Applies one job event: the job's record (kept among the newest `keep`,
+        // and for each monitored tag it has), the per-minute, per-class and
+        // per-queue counts, the queue and batch seen.
+        fn record(e: DashboardEvent)
         fn job(id: string) -> JobRecord
         // Newest first.
         fn recentJobs(limit: int) -> Array<JobRecord>
-        fn countMinute(minute: long, processed: long, failed: long)
-        // From `sinceMinute` on, oldest first, with empty minutes filled in.
+        // The jobs with `tag`: all kept for a monitored tag, else the recent ones that have it.
+        fn jobsWithTag(tag: string, limit: int) -> Array<JobRecord>
+        // From `sinceMinute` to `untilMinute`, oldest first, empty minutes filled in.
         fn minutes(sinceMinute: long, untilMinute: long) -> Array<MinuteStat>
-        fn countJob(job: string, ms: long, failed: bool)
         fn jobMetrics() -> Array<JobMetric>
+        fn queueMetrics() -> Array<QueueMetric>
         fn workerStarted(w: WorkerInfo)
         fn workerStopped(name: string, at: long)
         fn workers() -> Array<WorkerInfo>
-        // A queue ("connection|queue") jobs were seen on.
-        fn noteQueue(connection: string, queue: string)
+        // "connection|queue" seen, sorted.
         fn queues() -> Array<string>
+        // Batch ids seen, newest first.
+        fn batchIds(limit: int) -> Array<string>
+        fn monitor(tag: string)
+        fn unmonitor(tag: string)
+        fn monitoredTags() -> Array<string>
         // Forgets everything.
         fn clear()
     }
 
-    // In this process's memory. Thread-safe.
+    // In this process's memory. Thread-safe (one lock).
     class MemoryDashboardStore implements DashboardStore {
         public keep: int
         private jobs: HashMap<string, JobRecord>
         private order: Deque<string>
+        private tagged: HashMap<string, Deque<string>>      // monitored tag -> job ids, newest first
+        private taggedJobs: HashMap<string, JobRecord>      // records kept for a monitored tag
         private perMinute: HashMap<long, MinuteStat>
         private perJob: HashMap<string, JobMetric>
+        private perQueue: HashMap<string, QueueMetric>
         private workerMap: HashMap<string, WorkerInfo>
-        private seen: HashSet<string>
+        private batches: Deque<string>
         private lock: Mutex
         constructor(keep: int = 1000) {
             self.keep = keep;
             self.jobs = new HashMap<string, JobRecord>();
             self.order = new Deque<string>();
+            self.tagged = new HashMap<string, Deque<string>>();
+            self.taggedJobs = new HashMap<string, JobRecord>();
             self.perMinute = new HashMap<long, MinuteStat>();
             self.perJob = new HashMap<string, JobMetric>();
+            self.perQueue = new HashMap<string, QueueMetric>();
             self.workerMap = new HashMap<string, WorkerInfo>();
-            self.seen = new HashSet<string>();
+            self.batches = new Deque<string>();
             self.lock = new Mutex();
         }
-        fn saveJob(r: JobRecord) {
+        fn record(e: DashboardEvent) {
             self.lock.lock();
-            if (!self.jobs.containsKey(r.id)) {
-                self.order.pushFront(r.id);
-                while (self.order.size() > self.keep) { self.jobs.remove(self.order.popBack()); }
+            // the record
+            let r = self.jobs.getOr(e.jobId, null);
+            if (r == null) { r = self.taggedJobs.getOr(e.jobId, null); }
+            if (r == null) { r = new JobRecord(e.jobId); }
+            r.apply(e);
+            if (!e.silenced) {
+                if (!self.jobs.containsKey(e.jobId)) {
+                    self.order.pushFront(e.jobId);
+                    while (self.order.size() > self.keep) { self.jobs.remove(self.order.popBack()); }
+                }
+                self.jobs.put(e.jobId, r);
             }
-            self.jobs.put(r.id, r);
+            for (t in r.tags) {
+                let ids = self.tagged.getOr(t, null);
+                if (ids == null) { continue; }                    // not monitored
+                if (!self.taggedJobs.containsKey(e.jobId)) {
+                    ids.pushFront(e.jobId);
+                    while (ids.size() > self.keep) { self.taggedJobs.remove(ids.popBack()); }
+                }
+                self.taggedJobs.put(e.jobId, r);
+            }
+            // counts
+            let minute = e.at / 60000;
+            if (e.kind == "processed" || e.kind == "failed") {
+                let m = self.perMinute.getOr(minute, null);
+                if (m == null) {
+                    m = new MinuteStat(minute);
+                    self.perMinute.put(minute, m);
+                    if (self.perMinute.size() > 2880) {          // (two days of minutes at most)
+                        for (k in self.perMinute.keys()) { if (k < minute - 2880) { self.perMinute.remove(k); } }
+                    }
+                }
+                let j = self.perJob.getOr(r.job, null);
+                if (j == null) { j = new JobMetric(r.job); self.perJob.put(r.job, j); }
+                let q = self.queueMetric(r.connection + "|" + r.queue);
+                if (e.kind == "processed") {
+                    m.processed += 1;
+                    j.processed += 1;
+                    j.totalMs += e.runMs;
+                    if (e.runMs > j.maxMs) { j.maxMs = e.runMs; }
+                    q.processed += 1;
+                    q.totalRunMs += e.runMs;
+                } else {
+                    m.failed += 1;
+                    j.failed += 1;
+                    q.failed += 1;
+                }
+            } else if (e.kind == "processing" && e.waitMs >= 0) {
+                let q = self.queueMetric(r.connection + "|" + r.queue);
+                q.totalWaitMs += e.waitMs;
+                q.waits += 1;
+                if (e.waitMs > q.maxWaitMs) { q.maxWaitMs = e.waitMs; }
+            } else if (e.kind == "queued") {
+                self.queueMetric(e.queueKey());
+            }
+            if (e.batchId != "" && !self.batches.contains(e.batchId)) {
+                self.batches.pushFront(e.batchId);
+                while (self.batches.size() > 200) { self.batches.popBack(); }
+            }
             self.lock.unlock();
+        }
+        private fn queueMetric(key: string) -> QueueMetric {
+            let q = self.perQueue.getOr(key, null);
+            if (q == null) { q = new QueueMetric(key); self.perQueue.put(key, q); }
+            return q;
         }
         fn job(id: string) -> JobRecord {
             self.lock.lock();
             let r = self.jobs.getOr(id, null);
+            if (r == null) { r = self.taggedJobs.getOr(id, null); }
             self.lock.unlock();
             return r;
         }
@@ -153,17 +334,25 @@ namespace apogee {
             self.lock.unlock();
             return out;
         }
-        fn countMinute(minute: long, processed: long, failed: long) {
+        fn jobsWithTag(tag: string, limit: int) -> Array<JobRecord> {
+            let out = new Array<JobRecord>();
             self.lock.lock();
-            let m = self.perMinute.getOr(minute, null);
-            if (m == null) { m = new MinuteStat(minute); self.perMinute.put(minute, m); }
-            m.processed += processed;
-            m.failed += failed;
-            // (two days of minutes at most)
-            if (self.perMinute.size() > 2880) {
-                for (k in self.perMinute.keys()) { if (k < minute - 2880) { self.perMinute.remove(k); } }
+            let ids = self.tagged.getOr(tag, null);
+            if (ids != null) {
+                for (id in ids) {
+                    if (out.size() >= limit) { break; }
+                    let r = self.taggedJobs.getOr(id, null);
+                    if (r != null) { out.push(r); }
+                }
+            } else {
+                for (id in self.order) {
+                    if (out.size() >= limit) { break; }
+                    let r = self.jobs.getOr(id, null);
+                    if (r != null && r.hasTag(tag)) { out.push(r); }
+                }
             }
             self.lock.unlock();
+            return out;
         }
         fn minutes(sinceMinute: long, untilMinute: long) -> Array<MinuteStat> {
             let out = new Array<MinuteStat>();
@@ -179,23 +368,18 @@ namespace apogee {
             self.lock.unlock();
             return out;
         }
-        fn countJob(job: string, ms: long, failed: bool) {
-            self.lock.lock();
-            let j = self.perJob.getOr(job, null);
-            if (j == null) { j = new JobMetric(job); self.perJob.put(job, j); }
-            if (failed) { j.failed += 1; }
-            else {
-                j.processed += 1;
-                j.totalMs += ms;
-                if (ms > j.maxMs) { j.maxMs = ms; }
-            }
-            self.lock.unlock();
-        }
         fn jobMetrics() -> Array<JobMetric> {
             self.lock.lock();
             let out = self.perJob.values();
             self.lock.unlock();
             out.sortBy(fn(a: JobMetric, b: JobMetric) => Str.compare(a.job, b.job));
+            return out;
+        }
+        fn queueMetrics() -> Array<QueueMetric> {
+            self.lock.lock();
+            let out = self.perQueue.values();
+            self.lock.unlock();
+            out.sortBy(fn(a: QueueMetric, b: QueueMetric) => Str.compare(a.queue, b.queue));
             return out;
         }
         fn workerStarted(w: WorkerInfo) { self.lock.lock(); self.workerMap.put(w.name, w); self.lock.unlock(); }
@@ -212,170 +396,43 @@ namespace apogee {
             out.sortBy(fn(a: WorkerInfo, b: WorkerInfo) => Str.compare(a.name, b.name));
             return out;
         }
-        fn noteQueue(connection: string, queue: string) { self.lock.lock(); self.seen.add(connection + "|" + queue); self.lock.unlock(); }
         fn queues() -> Array<string> {
             self.lock.lock();
-            let out = self.seen.toArray();
+            let out = self.perQueue.keys();
+            self.lock.unlock();
+            out.sortBy(fn(a, b) => Str.compare(a, b));
+            return out;
+        }
+        fn batchIds(limit: int) -> Array<string> {
+            let out = new Array<string>();
+            self.lock.lock();
+            for (b in self.batches) { if (out.size() < limit) { out.push(b); } }
+            self.lock.unlock();
+            return out;
+        }
+        fn monitor(tag: string) {
+            self.lock.lock();
+            if (!self.tagged.containsKey(tag)) { self.tagged.put(tag, new Deque<string>()); }
+            self.lock.unlock();
+        }
+        fn unmonitor(tag: string) {
+            self.lock.lock();
+            let ids = self.tagged.getOr(tag, null);
+            self.tagged.remove(tag);
+            if (ids != null) { for (id in ids) { self.taggedJobs.remove(id); } }
+            self.lock.unlock();
+        }
+        fn monitoredTags() -> Array<string> {
+            self.lock.lock();
+            let out = self.tagged.keys();
             self.lock.unlock();
             out.sortBy(fn(a, b) => Str.compare(a, b));
             return out;
         }
         fn clear() {
             self.lock.lock();
-            self.jobs.clear(); self.order.clear(); self.perMinute.clear(); self.perJob.clear(); self.workerMap.clear(); self.seen.clear();
-            self.lock.unlock();
-        }
-    }
-
-    // In Redis, shared by every process (workers write, the dashboard reads).
-    // Keys start with `prefix`; per-minute counts expire after two days.
-    class RedisDashboardStore implements DashboardStore {
-        public keep: int
-        public prefix: string
-        private redis: RedisConnection
-        private lock: Mutex
-        constructor(redis: RedisConnection, prefix: string = "queue-dashboard:", keep: int = 1000) {
-            self.redis = redis;
-            self.prefix = prefix;
-            self.keep = keep;
-            self.lock = new Mutex();
-        }
-        private fn k(name: string) -> string { return self.prefix + name; }
-        fn saveJob(r: JobRecord) {
-            self.lock.lock();
-            let isNew = self.redis.hSet(self.k("jobs"), r.id, r.toJson().toJson()) == 1;
-            if (isNew) {
-                self.redis.lPush(self.k("recent"), r.id);
-                let dropped = self.redis.lRange(self.k("recent"), self.keep as long, -1);
-                if (dropped.size() > 0) {
-                    self.redis.lTrim(self.k("recent"), 0, (self.keep - 1) as long);
-                    self.redis.hDel(self.k("jobs"), dropped);
-                }
-            }
-            self.lock.unlock();
-        }
-        fn job(id: string) -> JobRecord {
-            self.lock.lock();
-            let text = self.redis.hGet(self.k("jobs"), id);
-            self.lock.unlock();
-            return text == null ? null : JobRecord.fromJson(Json.parse(text));
-        }
-        fn recentJobs(limit: int) -> Array<JobRecord> {
-            let out = new Array<JobRecord>();
-            self.lock.lock();
-            let ids = self.redis.lRange(self.k("recent"), 0, (limit - 1) as long);
-            let all = self.redis.hGetAll(self.k("jobs"));
-            self.lock.unlock();
-            for (id in ids) {
-                if (all.containsKey(id)) { out.push(JobRecord.fromJson(Json.parse(all.get(id)))); }
-            }
-            return out;
-        }
-        fn countMinute(minute: long, processed: long, failed: long) {
-            let key = self.k("minute:" + str(minute));
-            self.lock.lock();
-            if (processed != 0) { self.redis.hIncrBy(key, "processed", processed); }
-            if (failed != 0) { self.redis.hIncrBy(key, "failed", failed); }
-            self.redis.expire(key, 172800);
-            self.lock.unlock();
-        }
-        fn minutes(sinceMinute: long, untilMinute: long) -> Array<MinuteStat> {
-            let out = new Array<MinuteStat>();
-            self.lock.lock();
-            let m = sinceMinute;
-            while (m <= untilMinute) {
-                let h = self.redis.hGetAll(self.k("minute:" + str(m)));
-                let s = new MinuteStat(m);
-                s.processed = Integer.parseOr(h.getOr("processed", "0"), 0);
-                s.failed = Integer.parseOr(h.getOr("failed", "0"), 0);
-                out.push(s);
-                m += 1;
-            }
-            self.lock.unlock();
-            return out;
-        }
-        fn countJob(job: string, ms: long, failed: bool) {
-            let key = self.k("job:" + job);
-            self.lock.lock();
-            self.redis.sAdd(self.k("job-classes"), job);
-            if (failed) { self.redis.hIncrBy(key, "failed", 1); }
-            else {
-                self.redis.hIncrBy(key, "processed", 1);
-                self.redis.hIncrBy(key, "totalMs", ms);
-                let max = Integer.parseOr(self.redis.hGet(key, "maxMs") ?? "0", 0);
-                if (ms > max) { self.redis.hSet(key, "maxMs", ms); }
-            }
-            self.lock.unlock();
-        }
-        fn jobMetrics() -> Array<JobMetric> {
-            let out = new Array<JobMetric>();
-            self.lock.lock();
-            for (job in self.redis.sMembers(self.k("job-classes"))) {
-                let h = self.redis.hGetAll(self.k("job:" + job));
-                let m = new JobMetric(job);
-                m.processed = Integer.parseOr(h.getOr("processed", "0"), 0);
-                m.failed = Integer.parseOr(h.getOr("failed", "0"), 0);
-                m.totalMs = Integer.parseOr(h.getOr("totalMs", "0"), 0);
-                m.maxMs = Integer.parseOr(h.getOr("maxMs", "0"), 0);
-                out.push(m);
-            }
-            self.lock.unlock();
-            out.sortBy(fn(a: JobMetric, b: JobMetric) => Str.compare(a.job, b.job));
-            return out;
-        }
-        fn workerStarted(w: WorkerInfo) {
-            let o = Json.object();
-            o.set("connection", w.connection);
-            o.set("queues", w.queues);
-            o.set("startedAt", w.startedAt);
-            o.set("stoppedAt", 0 as long);
-            self.lock.lock();
-            self.redis.hSet(self.k("workers"), w.name, o.toJson());
-            self.lock.unlock();
-        }
-        fn workerStopped(name: string, at: long) {
-            self.lock.lock();
-            let text = self.redis.hGet(self.k("workers"), name);
-            if (text != null) {
-                let o = Json.parse(text);
-                o.set("stoppedAt", at);
-                self.redis.hSet(self.k("workers"), name, o.toJson());
-            }
-            self.lock.unlock();
-        }
-        fn workers() -> Array<WorkerInfo> {
-            self.lock.lock();
-            let all = self.redis.hGetAll(self.k("workers"));
-            self.lock.unlock();
-            let out = new Array<WorkerInfo>();
-            for ((name, text) in all) {
-                let o = Json.parse(text);
-                let w = new WorkerInfo(name);
-                w.connection = o.getString("connection", "");
-                w.queues = o.getString("queues", "");
-                w.startedAt = o.getLong("startedAt", 0);
-                w.stoppedAt = o.getLong("stoppedAt", 0);
-                out.push(w);
-            }
-            out.sortBy(fn(a: WorkerInfo, b: WorkerInfo) => Str.compare(a.name, b.name));
-            return out;
-        }
-        fn noteQueue(connection: string, queue: string) {
-            self.lock.lock();
-            self.redis.sAdd(self.k("queues"), connection + "|" + queue);
-            self.lock.unlock();
-        }
-        fn queues() -> Array<string> {
-            self.lock.lock();
-            let out = self.redis.sMembers(self.k("queues"));
-            self.lock.unlock();
-            out.sortBy(fn(a, b) => Str.compare(a, b));
-            return out;
-        }
-        fn clear() {
-            self.lock.lock();
-            let ks = self.redis.keys(self.prefix + "*");
-            if (ks.size() > 0) { self.redis.del(ks); }
+            self.jobs.clear(); self.order.clear(); self.tagged.clear(); self.taggedJobs.clear(); self.perMinute.clear();
+            self.perJob.clear(); self.perQueue.clear(); self.workerMap.clear(); self.batches.clear();
             self.lock.unlock();
         }
     }
