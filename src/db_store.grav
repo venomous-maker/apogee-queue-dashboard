@@ -1,0 +1,311 @@
+// db_store.grav — the dashboard's record in a database (SQLite, MySQL or
+// PostgreSQL through grav-db), shared by every process that uses it. Each job
+// event is one transaction: the record merged and saved, and every count an
+// upsert. Tables are made by createTables(); their names start with `prefix`.
+import "std"
+import "grav-db"
+import "metrics.grav"
+use db.*
+
+namespace apogee {
+
+    class DatabaseDashboardStore implements DashboardStore {
+        public keep: int
+        public prefix: string
+        private pool: Pool
+        private driver: string = ""
+        private monitoredCache: HashSet<string> = new HashSet<string>()
+        private monitoredAt: long = 0
+        private writes: AtomicInt = new AtomicInt(0)
+        private lock: Mutex = new Mutex()
+
+        constructor(pool: Pool, prefix: string = "queue_dashboard_", keep: int = 1000) {
+            self.pool = pool;
+            self.prefix = prefix;
+            self.keep = keep;
+        }
+        private fn t(name: string) -> string { return self.prefix + name; }
+        // Runs `f` with a connection from the pool.
+        private fn with(f: fn(Connection)) {
+            let c = self.pool.acquire();
+            if (self.driver == "") { self.driver = c.driver(); }
+            try { f(c); } finally { self.pool.release(c); }
+        }
+
+        // Makes the tables (nothing for those already there).
+        fn createTables() {
+            self.with(fn(c: Connection) {
+                let text = c.driver() == "mysql" ? "LONGTEXT" : "TEXT";
+                let key = "VARCHAR(191)";
+                c.exec("CREATE TABLE IF NOT EXISTS " + self.t("jobs") + " (id " + key + " NOT NULL PRIMARY KEY, seq BIGINT NOT NULL, " +
+                       "recent INTEGER NOT NULL, record " + text + " NOT NULL)");
+                c.exec("CREATE TABLE IF NOT EXISTS " + self.t("tag_jobs") + " (tag " + key + " NOT NULL, job_id " + key + " NOT NULL, " +
+                       "seq BIGINT NOT NULL, PRIMARY KEY (tag, job_id))");
+                c.exec("CREATE TABLE IF NOT EXISTS " + self.t("monitored") + " (tag " + key + " NOT NULL PRIMARY KEY)");
+                c.exec("CREATE TABLE IF NOT EXISTS " + self.t("minutes") + " (minute BIGINT NOT NULL PRIMARY KEY, processed BIGINT NOT NULL, failed BIGINT NOT NULL)");
+                c.exec("CREATE TABLE IF NOT EXISTS " + self.t("job_metrics") + " (job " + key + " NOT NULL PRIMARY KEY, processed BIGINT NOT NULL, " +
+                       "failed BIGINT NOT NULL, total_ms BIGINT NOT NULL, max_ms BIGINT NOT NULL)");
+                c.exec("CREATE TABLE IF NOT EXISTS " + self.t("queue_metrics") + " (queue " + key + " NOT NULL PRIMARY KEY, processed BIGINT NOT NULL, " +
+                       "failed BIGINT NOT NULL, total_run_ms BIGINT NOT NULL, total_wait_ms BIGINT NOT NULL, waits BIGINT NOT NULL, max_wait_ms BIGINT NOT NULL)");
+                c.exec("CREATE TABLE IF NOT EXISTS " + self.t("workers") + " (name " + key + " NOT NULL PRIMARY KEY, data " + text + " NOT NULL)");
+                c.exec("CREATE TABLE IF NOT EXISTS " + self.t("batches") + " (id " + key + " NOT NULL PRIMARY KEY, seq BIGINT NOT NULL)");
+            });
+        }
+
+        // ── SQL that differs between databases ─────────────────────────────────
+        // INSERT ... or, when `key` is taken, each column updated by its op:
+        // "add" (existing + new), "max" (the larger), "set" (the new value).
+        private fn upsertSql(table: string, key: string, cols: Array<string>, ops: Array<string>) -> string {
+            let names = new Array<string>();
+            names.push(key);
+            for (c in cols) { names.push(c); }
+            let marks = new Array<string>();
+            for (n in names) { marks.push("?"); }
+            let sql = "INSERT INTO " + table + " (" + Str.join(names, ", ") + ") VALUES (" + Str.join(marks, ", ") + ")";
+            let sets = new Array<string>();
+            let mysql = self.driver == "mysql";
+            for (i, c in cols) {
+                let old = mysql ? c : table + "." + c;
+                let fresh = mysql ? "VALUES(" + c + ")" : "excluded." + c;
+                let maxFn = self.driver == "sqlite" ? "MAX" : "GREATEST";
+                switch (ops[i]) {
+                    case "add": sets.push(c + " = " + old + " + " + fresh)
+                    case "max": sets.push(c + " = " + maxFn + "(" + old + ", " + fresh + ")")
+                    default: sets.push(c + " = " + fresh)
+                }
+            }
+            return mysql ? sql + " ON DUPLICATE KEY UPDATE " + Str.join(sets, ", ")
+                         : sql + " ON CONFLICT (" + key + ") DO UPDATE SET " + Str.join(sets, ", ");
+        }
+        // INSERT that does nothing when the row exists.
+        private fn insertIgnoreSql(table: string, cols: Array<string>) -> string {
+            let marks = new Array<string>();
+            for (c in cols) { marks.push("?"); }
+            let body = table + " (" + Str.join(cols, ", ") + ") VALUES (" + Str.join(marks, ", ") + ")";
+            if (self.driver == "mysql") { return "INSERT IGNORE INTO " + body; }
+            if (self.driver == "sqlite") { return "INSERT OR IGNORE INTO " + body; }
+            return "INSERT INTO " + body + " ON CONFLICT DO NOTHING";
+        }
+
+        // The monitored tags, read at most every five seconds.
+        private fn monitoredNow(c: Connection) -> HashSet<string> {
+            self.lock.lock();
+            let fresh = Time.nowMs() - self.monitoredAt < 5000;
+            let cached = self.monitoredCache;
+            self.lock.unlock();
+            if (fresh) { return cached; }
+            let s = new HashSet<string>();
+            for (row in c.query("SELECT tag FROM " + self.t("monitored"))) { s.add(row.getString("tag")); }
+            self.lock.lock();
+            self.monitoredCache = s;
+            self.monitoredAt = Time.nowMs();
+            self.lock.unlock();
+            return s;
+        }
+
+        // ── writing ────────────────────────────────────────────────────────────
+        fn record(e: DashboardEvent) {
+            self.with(fn(c: Connection) {
+                let monitored = self.monitoredNow(c);
+                c.transaction(fn() {
+                    let row = c.queryOne("SELECT record, recent FROM " + self.t("jobs") + " WHERE id = ?", [e.jobId]);
+                    let r = row == null ? new JobRecord(e.jobId) : JobRecord.fromJson(Json.parse(row.getString("record")));
+                    r.apply(e);
+                    let text = r.toJson().toJson();
+                    let recent = e.silenced ? 0 : 1;
+                    if (row == null) {
+                        c.execute("INSERT INTO " + self.t("jobs") + " (id, seq, recent, record) VALUES (?, ?, ?, ?)", [e.jobId, e.at, recent, text]);
+                    } else {
+                        let was = Integer.parseOr(str(row.get("recent")), 0);
+                        c.execute("UPDATE " + self.t("jobs") + " SET record = ?, recent = ? WHERE id = ?", [text, was > recent ? was : recent, e.jobId]);
+                    }
+                    for (tag in r.tags) {
+                        if (monitored.contains(tag)) {
+                            c.execute(self.insertIgnoreSql(self.t("tag_jobs"), ["tag", "job_id", "seq"]), [tag, e.jobId, e.at]);
+                        }
+                    }
+                    let qk = r.connection + "|" + r.queue;
+                    if (e.kind == "processed" || e.kind == "failed") {
+                        let ok = e.kind == "processed";
+                        c.execute(self.upsertSql(self.t("minutes"), "minute", ["processed", "failed"], ["add", "add"]),
+                                  [e.at / 60000, ok ? 1 : 0, ok ? 0 : 1]);
+                        c.execute(self.upsertSql(self.t("job_metrics"), "job", ["processed", "failed", "total_ms", "max_ms"], ["add", "add", "add", "max"]),
+                                  [r.job, ok ? 1 : 0, ok ? 0 : 1, ok ? e.runMs : 0, ok ? e.runMs : 0]);
+                        c.execute(self.upsertSql(self.t("queue_metrics"), "queue",
+                                                 ["processed", "failed", "total_run_ms", "total_wait_ms", "waits", "max_wait_ms"],
+                                                 ["add", "add", "add", "add", "add", "max"]),
+                                  [qk, ok ? 1 : 0, ok ? 0 : 1, ok ? e.runMs : 0, 0, 0, 0]);
+                    } else if (e.kind == "processing" && e.waitMs >= 0) {
+                        c.execute(self.upsertSql(self.t("queue_metrics"), "queue",
+                                                 ["processed", "failed", "total_run_ms", "total_wait_ms", "waits", "max_wait_ms"],
+                                                 ["add", "add", "add", "add", "add", "max"]),
+                                  [qk, 0, 0, 0, e.waitMs, 1, e.waitMs]);
+                    } else if (e.kind == "queued") {
+                        c.execute(self.insertIgnoreSql(self.t("queue_metrics"),
+                                                       ["queue", "processed", "failed", "total_run_ms", "total_wait_ms", "waits", "max_wait_ms"]),
+                                  [qk, 0, 0, 0, 0, 0, 0]);
+                    }
+                    if (e.batchId != "") {
+                        c.execute(self.upsertSql(self.t("batches"), "id", ["seq"], ["set"]), [e.batchId, e.at]);
+                    }
+                });
+                // (old rows go every hundred writes, not on each)
+                if (self.writes.increment() % 100 == 0) { self.prune(c); }
+            });
+        }
+        // Keeps the newest `keep` recent jobs (and those a monitored tag holds),
+        // `keep` per monitored tag, 200 batches and two days of minutes.
+        fn prune(c: Connection) {
+            let cut = c.queryOne("SELECT seq FROM " + self.t("jobs") + " WHERE recent = 1 ORDER BY seq DESC LIMIT 1 OFFSET " + str(self.keep));
+            if (cut != null) {
+                let seq = Integer.parseOr(str(cut.get("seq")), 0);
+                c.execute("UPDATE " + self.t("jobs") + " SET recent = 0 WHERE recent = 1 AND seq <= ?", [seq]);
+            }
+            for (tag in self.monitoredNow(c).toArray()) {
+                let tcut = c.queryOne("SELECT seq FROM " + self.t("tag_jobs") + " WHERE tag = ? ORDER BY seq DESC LIMIT 1 OFFSET " + str(self.keep), [tag]);
+                if (tcut != null) { c.execute("DELETE FROM " + self.t("tag_jobs") + " WHERE tag = ? AND seq <= ?", [tag, Integer.parseOr(str(tcut.get("seq")), 0)]); }
+            }
+            c.execute("DELETE FROM " + self.t("jobs") + " WHERE recent = 0 AND id NOT IN (SELECT job_id FROM " + self.t("tag_jobs") + ")");
+            let bcut = c.queryOne("SELECT seq FROM " + self.t("batches") + " ORDER BY seq DESC LIMIT 1 OFFSET 200");
+            if (bcut != null) { c.execute("DELETE FROM " + self.t("batches") + " WHERE seq <= ?", [Integer.parseOr(str(bcut.get("seq")), 0)]); }
+            c.execute("DELETE FROM " + self.t("minutes") + " WHERE minute < ?", [Time.now() / 60 - 2880]);
+        }
+        fn workerStarted(w: WorkerInfo) {
+            self.with(fn(c: Connection) { c.execute(self.upsertSql(self.t("workers"), "name", ["data"], ["set"]), [w.name, w.toJson()]); });
+        }
+        fn workerStopped(name: string, at: long) {
+            self.with(fn(c: Connection) {
+                let row = c.queryOne("SELECT data FROM " + self.t("workers") + " WHERE name = ?", [name]);
+                if (row == null) { return; }
+                let w = WorkerInfo.fromJson(name, row.getString("data"));
+                w.stoppedAt = at;
+                c.execute("UPDATE " + self.t("workers") + " SET data = ? WHERE name = ?", [w.toJson(), name]);
+            });
+        }
+        fn monitor(tag: string) {
+            self.with(fn(c: Connection) { c.execute(self.insertIgnoreSql(self.t("monitored"), ["tag"]), [tag]); });
+            self.lock.lock(); self.monitoredAt = 0; self.lock.unlock();
+        }
+        fn unmonitor(tag: string) {
+            self.with(fn(c: Connection) {
+                c.execute("DELETE FROM " + self.t("monitored") + " WHERE tag = ?", [tag]);
+                c.execute("DELETE FROM " + self.t("tag_jobs") + " WHERE tag = ?", [tag]);
+            });
+            self.lock.lock(); self.monitoredAt = 0; self.lock.unlock();
+        }
+        fn clear() {
+            self.with(fn(c: Connection) {
+                for (n in ["jobs", "tag_jobs", "monitored", "minutes", "job_metrics", "queue_metrics", "workers", "batches"] as Array<string>) {
+                    c.execute("DELETE FROM " + self.t(n));
+                }
+            });
+            self.lock.lock(); self.monitoredAt = 0; self.lock.unlock();
+        }
+
+        // ── reading ────────────────────────────────────────────────────────────
+        private fn recordsFrom(rows: ResultSet) -> Array<JobRecord> {
+            let out = new Array<JobRecord>();
+            for (row in rows) { out.push(JobRecord.fromJson(Json.parse(row.getString("record")))); }
+            return out;
+        }
+        fn job(id: string) -> JobRecord {
+            let out: JobRecord = null;
+            self.with(fn(c: Connection) {
+                let row = c.queryOne("SELECT record FROM " + self.t("jobs") + " WHERE id = ?", [id]);
+                if (row != null) { out = JobRecord.fromJson(Json.parse(row.getString("record"))); }
+            });
+            return out;
+        }
+        fn recentJobs(limit: int) -> Array<JobRecord> {
+            let out = new Array<JobRecord>();
+            self.with(fn(c: Connection) {
+                out = self.recordsFrom(c.query("SELECT record FROM " + self.t("jobs") + " WHERE recent = 1 ORDER BY seq DESC LIMIT " + str(limit)));
+            });
+            return out;
+        }
+        fn jobsWithTag(tag: string, limit: int) -> Array<JobRecord> {
+            let out = new Array<JobRecord>();
+            self.with(fn(c: Connection) {
+                if (self.monitoredNow(c).contains(tag)) {
+                    out = self.recordsFrom(c.query("SELECT j.record AS record FROM " + self.t("tag_jobs") + " t JOIN " + self.t("jobs") +
+                                                   " j ON j.id = t.job_id WHERE t.tag = ? ORDER BY t.seq DESC LIMIT " + str(limit), [tag]));
+                    return;
+                }
+                for (r in self.recordsFrom(c.query("SELECT record FROM " + self.t("jobs") + " WHERE recent = 1 ORDER BY seq DESC LIMIT " + str(self.keep)))) {
+                    if (out.size() < limit && r.hasTag(tag)) { out.push(r); }
+                }
+            });
+            return out;
+        }
+        fn minutes(sinceMinute: long, untilMinute: long) -> Array<MinuteStat> {
+            let found = new HashMap<long, MinuteStat>();
+            self.with(fn(c: Connection) {
+                for (row in c.query("SELECT minute, processed, failed FROM " + self.t("minutes") + " WHERE minute >= ? AND minute <= ?", [sinceMinute, untilMinute])) {
+                    let s = new MinuteStat(Integer.parseOr(str(row.get("minute")), 0));
+                    s.processed = Integer.parseOr(str(row.get("processed")), 0);
+                    s.failed = Integer.parseOr(str(row.get("failed")), 0);
+                    found.put(s.minute, s);
+                }
+            });
+            let out = new Array<MinuteStat>();
+            let m = sinceMinute;
+            while (m <= untilMinute) { out.push(found.getOr(m, new MinuteStat(m))); m += 1; }
+            return out;
+        }
+        private static fn n(row: Row, col: string) -> long { return Integer.parseOr(str(row.get(col)), 0); }
+        fn jobMetrics() -> Array<JobMetric> {
+            let out = new Array<JobMetric>();
+            self.with(fn(c: Connection) {
+                for (row in c.query("SELECT job, processed, failed, total_ms, max_ms FROM " + self.t("job_metrics") + " ORDER BY job")) {
+                    let m = new JobMetric(row.getString("job"));
+                    m.processed = DatabaseDashboardStore.n(row, "processed");
+                    m.failed = DatabaseDashboardStore.n(row, "failed");
+                    m.totalMs = DatabaseDashboardStore.n(row, "total_ms");
+                    m.maxMs = DatabaseDashboardStore.n(row, "max_ms");
+                    out.push(m);
+                }
+            });
+            return out;
+        }
+        fn queueMetrics() -> Array<QueueMetric> {
+            let out = new Array<QueueMetric>();
+            self.with(fn(c: Connection) {
+                for (row in c.query("SELECT * FROM " + self.t("queue_metrics") + " ORDER BY queue")) {
+                    let m = new QueueMetric(row.getString("queue"));
+                    m.processed = DatabaseDashboardStore.n(row, "processed");
+                    m.failed = DatabaseDashboardStore.n(row, "failed");
+                    m.totalRunMs = DatabaseDashboardStore.n(row, "total_run_ms");
+                    m.totalWaitMs = DatabaseDashboardStore.n(row, "total_wait_ms");
+                    m.waits = DatabaseDashboardStore.n(row, "waits");
+                    m.maxWaitMs = DatabaseDashboardStore.n(row, "max_wait_ms");
+                    out.push(m);
+                }
+            });
+            return out;
+        }
+        fn workers() -> Array<WorkerInfo> {
+            let out = new Array<WorkerInfo>();
+            self.with(fn(c: Connection) {
+                for (row in c.query("SELECT name, data FROM " + self.t("workers") + " ORDER BY name")) {
+                    out.push(WorkerInfo.fromJson(row.getString("name"), row.getString("data")));
+                }
+            });
+            return out;
+        }
+        fn queues() -> Array<string> {
+            let out = new Array<string>();
+            self.with(fn(c: Connection) { for (row in c.query("SELECT queue FROM " + self.t("queue_metrics") + " ORDER BY queue")) { out.push(row.getString("queue")); } });
+            return out;
+        }
+        fn batchIds(limit: int) -> Array<string> {
+            let out = new Array<string>();
+            self.with(fn(c: Connection) { for (row in c.query("SELECT id FROM " + self.t("batches") + " ORDER BY seq DESC LIMIT " + str(limit))) { out.push(row.getString("id")); } });
+            return out;
+        }
+        fn monitoredTags() -> Array<string> {
+            let out = new Array<string>();
+            self.with(fn(c: Connection) { for (row in c.query("SELECT tag FROM " + self.t("monitored") + " ORDER BY tag")) { out.push(row.getString("tag")); } });
+            return out;
+        }
+    }
+}
