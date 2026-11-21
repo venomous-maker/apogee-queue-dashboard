@@ -1,0 +1,341 @@
+// redis_store.grav — the dashboard's record in Redis, shared by every process
+// (workers write, the web app reads). Each job event is one round trip: a Lua
+// script merges the job's record and updates every count on the server. Reads
+// are pipelined. Keys start with the prefix (not for Redis Cluster: the
+// script's keys are made inside it).
+import "std"
+import "grav-redis"
+import "metrics.grav"
+use redis.*
+
+namespace apogee {
+
+    class RedisDashboardStore implements DashboardStore {
+        public keep: int
+        public prefix: string
+        private redis: RedisConnection
+        private lock: Mutex
+        private sha: string = ""
+
+        constructor(redis: RedisConnection, prefix: string = "queue-dashboard:", keep: int = 1000) {
+            self.redis = redis;
+            self.prefix = prefix;
+            self.keep = keep;
+            self.lock = new Mutex();
+        }
+        private fn k(name: string) -> string { return self.prefix + name; }
+
+        // ── writing ────────────────────────────────────────────────────────────
+        fn record(e: DashboardEvent) {
+            let o = Json.object();
+            o.set("kind", e.kind);
+            o.set("job", e.job);
+            o.set("connection", e.connection);
+            o.set("queue", e.queue);
+            o.set("at", e.at);
+            o.set("queuedAt", e.queuedAt);
+            o.set("attempts", e.attempts as long);
+            o.set("runMs", e.runMs);
+            o.set("waitMs", e.waitMs);
+            o.set("error", e.error);
+            let t = Json.array();
+            for (x in e.tags) { t.push(x); }
+            o.set("tags", t);
+            o.set("payload", e.payload);
+            o.set("batchId", e.batchId);
+            o.set("silenced", e.silenced);
+            let args = new Array<any>();
+            args.push(e.jobId);
+            args.push(o.toJson());
+            args.push(self.keep as long);
+            args.push(self.prefix);
+            self.lock.lock();
+            try {
+                self.run(args);
+                self.lock.unlock();
+            } catch (x: Exception) {
+                self.lock.unlock();
+                throw x;
+            }
+        }
+        // EVALSHA, loading the script the first time (and again after SCRIPT FLUSH).
+        private fn run(args: Array<any>) {
+            if (self.sha == "") { self.sha = str(self.redis.command("SCRIPT", ["LOAD", RedisDashboardStore.script()])); }
+            let call = new Array<any>();
+            call.push(self.sha);
+            call.push(0 as long);
+            for (a in args) { call.push(a); }
+            try { self.redis.command("EVALSHA", call); }
+            catch (x: RedisError) {
+                if (!Str.contains(x.message(), "NOSCRIPT")) { throw x; }
+                self.sha = str(self.redis.command("SCRIPT", ["LOAD", RedisDashboardStore.script()]));
+                call[0] = self.sha;
+                self.redis.command("EVALSHA", call);
+            }
+        }
+
+        // The record merge (as JobRecord.apply) and every count, on the server.
+        private static fn script() -> string {
+            return r"""
+local id, e, keep, p = ARGV[1], cjson.decode(ARGV[2]), tonumber(ARGV[3]), ARGV[4]
+local raw = redis.call('HGET', p .. 'jobs', id) or redis.call('HGET', p .. 'tagjobs', id)
+local r
+if raw then r = cjson.decode(raw) else
+  r = {id = id, job = '', connection = '', queue = '', status = 'queued', attempts = 0, queuedAt = 0,
+       startedAt = 0, finishedAt = 0, ms = 0, waitMs = -1, error = '', tags = {}, payload = '', batchId = ''}
+end
+local function rank(s) if s == 'queued' then return 0 elseif s == 'processing' or s == 'released' then return 1 else return 2 end end
+if e.job ~= '' then r.job = e.job end
+if e.connection ~= '' then r.connection = e.connection end
+if e.queue ~= '' then r.queue = e.queue end
+if e.payload ~= '' then r.payload = e.payload end
+if e.batchId ~= '' then r.batchId = e.batchId end
+if #e.tags > 0 then r.tags = e.tags end
+if e.queuedAt > 0 and r.queuedAt == 0 then r.queuedAt = e.queuedAt end
+local k = e.kind
+if k == 'queued' then
+  if r.queuedAt == 0 then r.queuedAt = e.at end
+  if rank(r.status) == 0 then r.status = 'queued' end
+elseif k == 'processing' then
+  if e.attempts >= r.attempts then
+    r.status = 'processing'; r.attempts = e.attempts; r.startedAt = e.at
+    if e.waitMs >= 0 then r.waitMs = e.waitMs end
+  end
+elseif k == 'released' then
+  if r.status ~= 'processed' and r.status ~= 'failed' then r.status = 'released' end
+elseif k == 'processed' then r.status = 'processed'; r.finishedAt = e.at; r.ms = e.runMs
+elseif k == 'failed' then r.status = 'failed'; r.finishedAt = e.at; r.error = e.error end
+local json = cjson.encode(r)
+if not e.silenced then
+  if redis.call('HSET', p .. 'jobs', id, json) == 1 then
+    redis.call('LPUSH', p .. 'recent', id)
+    local dropped = redis.call('LRANGE', p .. 'recent', keep, -1)
+    if #dropped > 0 then
+      redis.call('LTRIM', p .. 'recent', 0, keep - 1)
+      redis.call('HDEL', p .. 'jobs', unpack(dropped))
+    end
+  end
+end
+for _, t in ipairs(r.tags) do
+  if redis.call('SISMEMBER', p .. 'monitored', t) == 1 then
+    redis.call('HSET', p .. 'tagjobs', id, json)
+    if redis.call('SADD', p .. 'tagset:' .. t, id) == 1 then
+      redis.call('LPUSH', p .. 'tag:' .. t, id)
+      local dropped = redis.call('LRANGE', p .. 'tag:' .. t, keep, -1)
+      if #dropped > 0 then
+        redis.call('LTRIM', p .. 'tag:' .. t, 0, keep - 1)
+        redis.call('SREM', p .. 'tagset:' .. t, unpack(dropped))
+        redis.call('HDEL', p .. 'tagjobs', unpack(dropped))
+      end
+    end
+  end
+end
+local qk = r.connection .. '|' .. r.queue
+if k == 'processed' or k == 'failed' then
+  local mk = p .. 'minute:' .. math.floor(e.at / 60000)
+  local jk = p .. 'job:' .. r.job
+  local qm = p .. 'queue:' .. qk
+  redis.call('SADD', p .. 'job-classes', r.job)
+  redis.call('SADD', p .. 'queues', qk)
+  if k == 'processed' then
+    redis.call('HINCRBY', mk, 'processed', 1)
+    redis.call('HINCRBY', jk, 'processed', 1)
+    redis.call('HINCRBY', jk, 'totalMs', e.runMs)
+    if e.runMs > tonumber(redis.call('HGET', jk, 'maxMs') or '0') then redis.call('HSET', jk, 'maxMs', e.runMs) end
+    redis.call('HINCRBY', qm, 'processed', 1)
+    redis.call('HINCRBY', qm, 'totalRunMs', e.runMs)
+  else
+    redis.call('HINCRBY', mk, 'failed', 1)
+    redis.call('HINCRBY', jk, 'failed', 1)
+    redis.call('HINCRBY', qm, 'failed', 1)
+  end
+  redis.call('EXPIRE', mk, 172800)
+elseif k == 'processing' and e.waitMs >= 0 then
+  local qm = p .. 'queue:' .. qk
+  redis.call('SADD', p .. 'queues', qk)
+  redis.call('HINCRBY', qm, 'totalWaitMs', e.waitMs)
+  redis.call('HINCRBY', qm, 'waits', 1)
+  if e.waitMs > tonumber(redis.call('HGET', qm, 'maxWaitMs') or '0') then redis.call('HSET', qm, 'maxWaitMs', e.waitMs) end
+elseif k == 'queued' then
+  redis.call('SADD', p .. 'queues', qk)
+end
+if e.batchId ~= '' then
+  redis.call('LREM', p .. 'batches', 0, e.batchId)
+  redis.call('LPUSH', p .. 'batches', e.batchId)
+  redis.call('LTRIM', p .. 'batches', 0, 199)
+end
+return 1
+""";
+        }
+
+        fn workerStarted(w: WorkerInfo) {
+            self.lock.lock();
+            self.redis.hSet(self.k("workers"), w.name, w.toJson());
+            self.lock.unlock();
+        }
+        fn workerStopped(name: string, at: long) {
+            self.lock.lock();
+            let text = self.redis.hGet(self.k("workers"), name);
+            if (text != null) {
+                let w = WorkerInfo.fromJson(name, text);
+                w.stoppedAt = at;
+                self.redis.hSet(self.k("workers"), name, w.toJson());
+            }
+            self.lock.unlock();
+        }
+        fn monitor(tag: string) { self.lock.lock(); self.redis.sAdd(self.k("monitored"), tag); self.lock.unlock(); }
+        fn unmonitor(tag: string) {
+            self.lock.lock();
+            self.redis.sRem(self.k("monitored"), [tag] as Array<any>);
+            let ids = self.redis.lRange(self.k("tag:" + tag), 0, -1);
+            if (ids.size() > 0) { self.redis.hDel(self.k("tagjobs"), ids); }
+            self.redis.del([self.k("tag:" + tag), self.k("tagset:" + tag)] as Array<string>);
+            self.lock.unlock();
+        }
+        fn clear() {
+            self.lock.lock();
+            let ks = self.redis.keys(self.prefix + "*");
+            if (ks.size() > 0) { self.redis.del(ks); }
+            self.lock.unlock();
+        }
+
+        // ── reading ────────────────────────────────────────────────────────────
+        // HMGET of `ids` from hash `name`, as records (missing ones left out).
+        private fn records(name: string, ids: Array<string>) -> Array<JobRecord> {
+            let out = new Array<JobRecord>();
+            if (ids.size() == 0) { return out; }
+            let args = new Array<any>();
+            args.push(self.k(name));
+            for (i in ids) { args.push(i); }
+            let got = self.redis.command("HMGET", args) as Array<any>;
+            for (v in got) { if (v != null) { out.push(JobRecord.fromJson(Json.parse(str(v)))); } }
+            return out;
+        }
+        fn job(id: string) -> JobRecord {
+            self.lock.lock();
+            let r = self.redis.pipeline(fn(p: RedisPipeline) {
+                p.command("HGET", [self.k("jobs"), id]);
+                p.command("HGET", [self.k("tagjobs"), id]);
+            });
+            self.lock.unlock();
+            let v = r[0] != null ? r[0] : r[1];
+            return v == null ? null : JobRecord.fromJson(Json.parse(str(v)));
+        }
+        fn recentJobs(limit: int) -> Array<JobRecord> {
+            self.lock.lock();
+            let ids = self.redis.lRange(self.k("recent"), 0, (limit - 1) as long);
+            let out = self.records("jobs", ids);
+            self.lock.unlock();
+            return out;
+        }
+        fn jobsWithTag(tag: string, limit: int) -> Array<JobRecord> {
+            self.lock.lock();
+            let monitored = self.redis.command("SISMEMBER", [self.k("monitored"), tag]) == 1;
+            let out = new Array<JobRecord>();
+            if (monitored) {
+                out = self.records("tagjobs", self.redis.lRange(self.k("tag:" + tag), 0, (limit - 1) as long));
+                self.lock.unlock();
+                return out;
+            }
+            let recent = self.records("jobs", self.redis.lRange(self.k("recent"), 0, (self.keep - 1) as long));
+            self.lock.unlock();
+            for (r in recent) { if (out.size() < limit && r.hasTag(tag)) { out.push(r); } }
+            return out;
+        }
+        fn minutes(sinceMinute: long, untilMinute: long) -> Array<MinuteStat> {
+            self.lock.lock();
+            let replies = self.redis.pipeline(fn(p: RedisPipeline) {
+                let m = sinceMinute;
+                while (m <= untilMinute) {
+                    p.command("HMGET", [self.k("minute:" + str(m)), "processed", "failed"]);
+                    m += 1;
+                }
+            });
+            self.lock.unlock();
+            let out = new Array<MinuteStat>();
+            for (i, r in replies) {
+                let s = new MinuteStat(sinceMinute + i as long);
+                let pair = r as Array<any>;
+                s.processed = pair[0] == null ? 0 : Integer.parseOr(str(pair[0]), 0);
+                s.failed = pair[1] == null ? 0 : Integer.parseOr(str(pair[1]), 0);
+                out.push(s);
+            }
+            return out;
+        }
+        // Every hash named by the members of set `set`: member -> fields.
+        private fn hashes(set: string, hashPrefix: string) -> Array<Pair<string, HashMap<string, string>>> {
+            self.lock.lock();
+            let names = self.redis.sMembers(self.k(set));
+            let replies = self.redis.pipeline(fn(p: RedisPipeline) {
+                for (n in names) { p.command("HGETALL", [self.k(hashPrefix + n)]); }
+            });
+            self.lock.unlock();
+            let out = new Array<Pair<string, HashMap<string, string>>>();
+            for (i, n in names) {
+                let flat = replies[i] as Array<any>;
+                let m = new HashMap<string, string>();
+                let j = 0;
+                while (j + 1 < flat.size()) { m.put(str(flat[j]), str(flat[j + 1])); j += 2; }
+                out.push((n, m));
+            }
+            return out;
+        }
+        fn jobMetrics() -> Array<JobMetric> {
+            let out = new Array<JobMetric>();
+            for (h in self.hashes("job-classes", "job:")) {
+                let m = new JobMetric(h.first);
+                m.processed = Integer.parseOr(h.second.getOr("processed", "0"), 0);
+                m.failed = Integer.parseOr(h.second.getOr("failed", "0"), 0);
+                m.totalMs = Integer.parseOr(h.second.getOr("totalMs", "0"), 0);
+                m.maxMs = Integer.parseOr(h.second.getOr("maxMs", "0"), 0);
+                out.push(m);
+            }
+            out.sortBy(fn(a: JobMetric, b: JobMetric) => Str.compare(a.job, b.job));
+            return out;
+        }
+        fn queueMetrics() -> Array<QueueMetric> {
+            let out = new Array<QueueMetric>();
+            for (h in self.hashes("queues", "queue:")) {
+                let m = new QueueMetric(h.first);
+                m.processed = Integer.parseOr(h.second.getOr("processed", "0"), 0);
+                m.failed = Integer.parseOr(h.second.getOr("failed", "0"), 0);
+                m.totalRunMs = Integer.parseOr(h.second.getOr("totalRunMs", "0"), 0);
+                m.totalWaitMs = Integer.parseOr(h.second.getOr("totalWaitMs", "0"), 0);
+                m.waits = Integer.parseOr(h.second.getOr("waits", "0"), 0);
+                m.maxWaitMs = Integer.parseOr(h.second.getOr("maxWaitMs", "0"), 0);
+                out.push(m);
+            }
+            out.sortBy(fn(a: QueueMetric, b: QueueMetric) => Str.compare(a.queue, b.queue));
+            return out;
+        }
+        fn workers() -> Array<WorkerInfo> {
+            self.lock.lock();
+            let all = self.redis.hGetAll(self.k("workers"));
+            self.lock.unlock();
+            let out = new Array<WorkerInfo>();
+            for ((name, text) in all) { out.push(WorkerInfo.fromJson(name, text)); }
+            out.sortBy(fn(a: WorkerInfo, b: WorkerInfo) => Str.compare(a.name, b.name));
+            return out;
+        }
+        fn queues() -> Array<string> {
+            self.lock.lock();
+            let out = self.redis.sMembers(self.k("queues"));
+            self.lock.unlock();
+            out.sortBy(fn(a, b) => Str.compare(a, b));
+            return out;
+        }
+        fn batchIds(limit: int) -> Array<string> {
+            self.lock.lock();
+            let out = self.redis.lRange(self.k("batches"), 0, (limit - 1) as long);
+            self.lock.unlock();
+            return out;
+        }
+        fn monitoredTags() -> Array<string> {
+            self.lock.lock();
+            let out = self.redis.sMembers(self.k("monitored"));
+            self.lock.unlock();
+            out.sortBy(fn(a, b) => Str.compare(a, b));
+            return out;
+        }
+    }
+}
