@@ -6,6 +6,8 @@ compiler versions it builds with.
 
 ## Unreleased
 
+## 0.2.0 (2026-11-21)
+
 ### Requirements
 
 - Needs grav 1.10.1 or later (its cycle collector fix) and apogee-queue 0.3.0
