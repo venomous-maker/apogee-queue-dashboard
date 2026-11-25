@@ -6,6 +6,8 @@ compiler versions it builds with.
 
 ## Unreleased
 
+## 0.3.0 (2026-11-25)
+
 Needs grav 1.12.0 or newer.
 
 - `QueueDashboardPackage`: the module connects itself to an apogee-framework app (apogee-package):
