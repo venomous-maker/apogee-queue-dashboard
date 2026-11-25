@@ -27,6 +27,21 @@ dash.alertWhenWaitExceeds(60, fn(w: LongWait) { notify("${w.queue} waits ${w.sec
 dash.monitor(60)                          // check the waits every minute
 ```
 
+## In an apogee-framework app
+
+Importing the module is all it takes: `QueueDashboardPackage` (apogee-package) connects it when
+the app is created. When `queue_dashboard.enabled`, the queue's jobs, waits, failures and batches are recorded and shown at `/queue-dashboard`. The page is open locally; elsewhere only to a signed-in user the gate allows `viewQueueDashboard`. The `QueueDashboard` is bound in the container.
+
+**Migration:** `CreateQueueDashboardTables` makes the eight `queue_dashboard_*` tables. Run `migrate` after adding the module.
+
+| Setting | Default |
+|---|---|
+| `queue_dashboard.enabled` | `QUEUE_DASHBOARD_ENABLED`, off |
+| `queue_dashboard.driver` | `QUEUE_DASHBOARD_DRIVER`: `database` (default), `redis` (`redis.url`) or `memory` |
+| `queue_dashboard.path` | `QUEUE_DASHBOARD_PATH`, `queue-dashboard` |
+
+Your own configuration wins over these defaults.
+
 ## What it records
 
 `attach(events)` listens to the queue's own events (the `Events` the
@@ -102,6 +117,7 @@ decides otherwise; it also guards every action.
 
 ```bash
 grav test tests/dashboard.grav
+grav test tests/package.grav
 ```
 
 They run jobs through a real worker and check that the memory, Redis and
