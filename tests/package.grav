@@ -1,0 +1,60 @@
+// QueueDashboardPackage: its tables from the migration, the database store and the page.
+import "std"
+import "apogee-container"
+import "apogee-config"
+import "apogee-package"
+import "apogee-events"
+import "apogee-http"
+import "apogee-routing"
+import "apogee-queue"
+import "apogee-testing"
+import "grav-db"
+import "grav-orbit"
+import "../src/all.grav"
+use apogee.*
+use db.*
+use orbit.*
+
+// What the framework binds, for a package to boot against.
+fn appContainer() -> Container {
+    let c = new Container()
+    c.instance::<Events>(new Events(c))
+    let r = new Router(c)
+    c.instance::<Router>(r)
+    c.instance::<HttpKernel>(new HttpKernel(r))
+    c.instance::<QueueManager>(new QueueManager(c))
+    r.aliasMiddleware("session", fn(a: Array<string>) -> Middleware { return new SameOriginOnly() })
+    return c
+}
+
+test "the package connects itself" {
+    let file = Dir.temp() + "/qd_pkg_" + str(Process.pid()) + ".sqlite"
+    new File(file).delete()
+    DB.connect(Sqlite.open(file))
+    let ps = Packages.discover()
+    assertEq(ps[0].name(), "queue_dashboard")
+    Packages.applyDefaults(ps)
+    for (m in ps[0].migrations()) { (m as Migration).up() }
+    assert(Schema.hasTable("queue_dashboard_jobs") && Schema.hasTable("queue_dashboard_batches"))
+    let c = appContainer()
+    Config.set("queue_dashboard.enabled", true)
+    let ctx = new PackageContext(c, "local", "")
+    ctx.poolFn = fn() -> Pool { return new Pool(1, fn() -> Connection { return Sqlite.open(file) as Connection }) }
+    ps[0].boot(ctx)
+    assert(c.make::<QueueDashboard>() != null)
+    new TestClient(c.make::<HttpKernel>()).get("/queue-dashboard").assertOk()
+    new File(file).delete()
+}
+
+// With QUEUE_DASHBOARD_MYSQL_URL / QUEUE_DASHBOARD_POSTGRES_URL set (mysql://… / postgres://…).
+test "the migration on MySQL and PostgreSQL" {
+    for (url in [env("QUEUE_DASHBOARD_MYSQL_URL"), env("QUEUE_DASHBOARD_POSTGRES_URL")]) {
+        if (url == "") { continue }
+        DB.connect(Str.startsWith(url, "mysql") ? MySql.open(url) as Connection : Postgres.open(url) as Connection)
+        for (m in Packages.discover()[0].migrations()) { (m as Migration).down() }
+        for (m in Packages.discover()[0].migrations()) { (m as Migration).up() }
+        assert(Schema.hasTable("queue_dashboard_jobs"))
+        for (m in Packages.discover()[0].migrations()) { (m as Migration).down() }
+        assert(!Schema.hasTable("queue_dashboard_jobs"))
+    }
+}
