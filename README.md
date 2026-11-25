@@ -10,7 +10,7 @@ wait grows too long. One page with its own CSS and script (no build step,
 nothing fetched from elsewhere), light and dark, refreshing every few seconds,
 over a JSON API. Its record lives in memory, in Redis, or in a database.
 
-```grav
+```typescript
 import "std"
 import "apogee-queue-dashboard"
 use apogee.*
