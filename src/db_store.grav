@@ -4,6 +4,7 @@
 // upsert. Tables are made by createTables(); their names start with `prefix`.
 import "std"
 import "grav-db"
+import "migration.grav"
 import "metrics.grav"
 use db.*
 
@@ -32,25 +33,8 @@ namespace apogee {
             try { f(c); } finally { self.pool.release(c); }
         }
 
-        // Makes the tables (nothing for those already there).
-        fn createTables() {
-            self.with(fn(c: Connection) {
-                let text = c.driver() == "mysql" ? "LONGTEXT" : "TEXT";
-                let key = "VARCHAR(191)";
-                c.exec("CREATE TABLE IF NOT EXISTS " + self.t("jobs") + " (id " + key + " NOT NULL PRIMARY KEY, seq BIGINT NOT NULL, " +
-                       "recent INTEGER NOT NULL, record " + text + " NOT NULL)");
-                c.exec("CREATE TABLE IF NOT EXISTS " + self.t("tag_jobs") + " (tag " + key + " NOT NULL, job_id " + key + " NOT NULL, " +
-                       "seq BIGINT NOT NULL, PRIMARY KEY (tag, job_id))");
-                c.exec("CREATE TABLE IF NOT EXISTS " + self.t("monitored") + " (tag " + key + " NOT NULL PRIMARY KEY)");
-                c.exec("CREATE TABLE IF NOT EXISTS " + self.t("minutes") + " (minute BIGINT NOT NULL PRIMARY KEY, processed BIGINT NOT NULL, failed BIGINT NOT NULL)");
-                c.exec("CREATE TABLE IF NOT EXISTS " + self.t("job_metrics") + " (job " + key + " NOT NULL PRIMARY KEY, processed BIGINT NOT NULL, " +
-                       "failed BIGINT NOT NULL, total_ms BIGINT NOT NULL, max_ms BIGINT NOT NULL)");
-                c.exec("CREATE TABLE IF NOT EXISTS " + self.t("queue_metrics") + " (queue " + key + " NOT NULL PRIMARY KEY, processed BIGINT NOT NULL, " +
-                       "failed BIGINT NOT NULL, total_run_ms BIGINT NOT NULL, total_wait_ms BIGINT NOT NULL, waits BIGINT NOT NULL, max_wait_ms BIGINT NOT NULL)");
-                c.exec("CREATE TABLE IF NOT EXISTS " + self.t("workers") + " (name " + key + " NOT NULL PRIMARY KEY, data " + text + " NOT NULL)");
-                c.exec("CREATE TABLE IF NOT EXISTS " + self.t("batches") + " (id " + key + " NOT NULL PRIMARY KEY, seq BIGINT NOT NULL)");
-            });
-        }
+        // Makes the tables (nothing for those already there); in an app, `migrate` does (CreateQueueDashboardTables).
+        fn createTables() { self.with(fn(c: Connection) { CreateQueueDashboardTables.ensure(c, self.prefix); }); }
 
         // ── SQL that differs between databases ─────────────────────────────────
         // INSERT ... or, when `key` is taken, each column updated by its op:

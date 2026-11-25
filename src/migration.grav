@@ -1,0 +1,43 @@
+// migration.grav — the queue dashboard's tables (prefix queue_dashboard_), as a
+// migration for `migrate`; DatabaseDashboardStore.createTables() makes the same.
+import "std"
+import "grav-db"
+import "grav-orbit"
+use db.*
+use orbit.*
+
+namespace apogee {
+
+    class CreateQueueDashboardTables extends Migration {
+        public prefix: string
+        constructor(prefix: string = "queue_dashboard_") { self.prefix = prefix; }
+        fn name() -> string { return "CreateQueueDashboardTables"; }
+        static fn tables() -> Array<string> { return ["jobs", "tag_jobs", "monitored", "minutes", "job_metrics", "queue_metrics", "workers", "batches"]; }
+        fn up() { CreateQueueDashboardTables.ensure(DB.connection(), self.prefix); }
+        fn down() { for (t in CreateQueueDashboardTables.tables()) { Schema.dropIfExists(self.prefix + t); } }
+        private static fn make(c: Connection, table: string, f: fn(Blueprint)) {
+            if (!Schema.hasTableOn(c, table)) { Schema.createOn(c, table, f); }
+        }
+        static fn ensure(c: Connection, p: string) {
+            CreateQueueDashboardTables.make(c, p + "jobs", fn(t: Blueprint) {
+                t.varchar("id", 191).primary(); t.bigInteger("seq"); t.integer("recent"); t.longText("record");
+            });
+            CreateQueueDashboardTables.make(c, p + "tag_jobs", fn(t: Blueprint) {
+                t.varchar("tag", 191); t.varchar("job_id", 191); t.bigInteger("seq"); t.primary(["tag", "job_id"]);
+            });
+            CreateQueueDashboardTables.make(c, p + "monitored", fn(t: Blueprint) { t.varchar("tag", 191).primary(); });
+            CreateQueueDashboardTables.make(c, p + "minutes", fn(t: Blueprint) {
+                t.bigInteger("minute").primary(); t.bigInteger("processed"); t.bigInteger("failed");
+            });
+            CreateQueueDashboardTables.make(c, p + "job_metrics", fn(t: Blueprint) {
+                t.varchar("job", 191).primary(); t.bigInteger("processed"); t.bigInteger("failed"); t.bigInteger("total_ms"); t.bigInteger("max_ms");
+            });
+            CreateQueueDashboardTables.make(c, p + "queue_metrics", fn(t: Blueprint) {
+                t.varchar("queue", 191).primary(); t.bigInteger("processed"); t.bigInteger("failed"); t.bigInteger("total_run_ms");
+                t.bigInteger("total_wait_ms"); t.bigInteger("waits"); t.bigInteger("max_wait_ms");
+            });
+            CreateQueueDashboardTables.make(c, p + "workers", fn(t: Blueprint) { t.varchar("name", 191).primary(); t.longText("data"); });
+            CreateQueueDashboardTables.make(c, p + "batches", fn(t: Blueprint) { t.varchar("id", 191).primary(); t.bigInteger("seq"); });
+        }
+    }
+}
