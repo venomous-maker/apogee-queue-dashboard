@@ -6,6 +6,13 @@ compiler versions it builds with.
 
 ## Unreleased
 
+Needs grav 1.12.0 or newer.
+
+- `QueueDashboardPackage`: the module connects itself to an apogee-framework app (apogee-package):
+  its settings, wiring moved here from the framework.
+- Its tables as a migration (`CreateQueueDashboardTables`, run by `migrate`); the store's own
+  table-making method uses the same definition.
+
 ## 0.2.0 (2026-11-21)
 
 ### Requirements
