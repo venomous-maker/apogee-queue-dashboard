@@ -1,0 +1,45 @@
+// package.grav — how apogee-queue-dashboard connects itself to an app
+// (apogee-package): queue_dashboard.enabled shows the queue's jobs, waits,
+// failures and batches at /queue-dashboard, kept in the database (its tables:
+// CreateQueueDashboardTables), Redis or memory.
+import "std"
+import "apogee-config"
+import "apogee-package"
+import "apogee-events"
+import "apogee-routing"
+import "apogee-queue"
+import "grav-redis"
+import "dashboard.grav"
+import "db_store.grav"
+import "redis_store.grav"
+import "migration.grav"
+use redis.*
+
+namespace apogee {
+
+    class QueueDashboardPackage extends ApogeePackage {
+        constructor() {}
+        fn name() -> string { return "queue_dashboard"; }
+        fn enabled() -> bool { return true; }
+        fn defaults() -> HashMap<string, any> {
+            return {"queue_dashboard.enabled": Env.getBool("QUEUE_DASHBOARD_ENABLED", false),
+                    "queue_dashboard.driver": Env.get("QUEUE_DASHBOARD_DRIVER", "database"),
+                    "queue_dashboard.path": Env.get("QUEUE_DASHBOARD_PATH", "queue-dashboard")};
+        }
+        fn migrations() -> Array<any> { return [new CreateQueueDashboardTables() as any]; }
+        fn boot(app: PackageContext) {
+            if (!Config.getBool("queue_dashboard.enabled", false)) { return; }
+            let driver = Config.getString("queue_dashboard.driver", "database");
+            let store: DashboardStore = null;
+            if (driver == "redis") { store = new RedisDashboardStore(RedisConnection.open(Config.getString("redis.url"))); }
+            else if (driver == "database") { store = new DatabaseDashboardStore(app.storePool()); }
+            else { store = new MemoryDashboardStore(); }
+            let dash = new QueueDashboard(app.make::<QueueManager>(), store);
+            app.container.instance::<QueueDashboard>(dash);
+            dash.attach(app.make::<Events>());
+            dash.gate(app.dashboardGate("viewQueueDashboard"));
+            let path = Config.getString("queue_dashboard.path", "queue-dashboard");
+            app.dashboardRoutes(fn(g: Router) { dash.routes(g, path); });
+        }
+    }
+}
